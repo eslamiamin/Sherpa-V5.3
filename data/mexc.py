@@ -1,137 +1,348 @@
 """
 MEXC Data Provider Module.
 
-Handles fetching historical and current market klines (candlesticks)
-from the MEXC exchange API. It ensures that only completed candles
-are returned to prevent look-ahead bias in the trading strategy.
+Fetches closed OHLCV candles from the MEXC public API.
+
+The provider:
+- Uses a reusable HTTP session.
+- Applies request timeout and limited retries.
+- Filters out the currently-forming candle.
+- Returns normalized pandas DataFrames.
 """
 
 import logging
-import requests
-import pandas as pd
 from datetime import datetime, timezone
+from typing import Optional
+
+import pandas as pd
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 import config
 
-# Configure logger for this module
+
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# HTTP SESSION
+# ============================================================
+
+def _create_session() -> requests.Session:
+    """
+    Create a reusable HTTP session with limited automatic retries.
+
+    Retries are only used for transient server/network errors.
+    """
+
+    session = requests.Session()
+
+    retry_strategy = Retry(
+        total=2,
+        connect=2,
+        read=2,
+        status=2,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_connections=10,
+        pool_maxsize=10,
+    )
+
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    session.headers.update({
+        "User-Agent": "SHERPA-V5.3"
+    })
+
+    return session
+
+
+SESSION = _create_session()
+
+
+# ============================================================
+# KLINE FETCHER
+# ============================================================
 
 def fetch_mexc_klines(
     symbol: str,
     interval: str = "60m",
-    limit: int = 300
+    limit: int = 300,
 ) -> pd.DataFrame:
     """
-    Fetch OHLCV candles from MEXC for a given symbol and interval.
+    Fetch closed OHLCV candles from MEXC.
 
-    The function retrieves data and filters out the currently-forming candle.
-    This is crucial for ensuring that the trading strategy operates only
-    on complete historical data.
+    Parameters
+    ----------
+    symbol:
+        Example: BTCUSDT, ETHUSDT, PAXGUSDT
 
-    Args:
-        symbol (str): The trading pair symbol (e.g., "BTCUSDT").
-        interval (str): The candle interval (e.g., "60m", "1d").
-        limit (int): The maximum number of candles to retrieve.
+    interval:
+        Example: 60m, 1d
 
-    Returns:
-        pd.DataFrame: A DataFrame containing historical kline data,
-                      with columns for timestamp, open, high, low, close,
-                      volume, close_time, and quote asset volume.
-                      The DataFrame is sorted by time and the last
-                      (currently forming) candle is excluded.
+    limit:
+        Number of candles requested.
 
-    Raises:
-        requests.exceptions.RequestException: If the API request fails.
-        ValueError: If the returned data is not in the expected format.
+    Returns
+    -------
+    pd.DataFrame
+        Closed candles sorted chronologically.
     """
-    api_url = config.MEXC_API_URL
-    
+
+    if not symbol:
+        raise ValueError("Symbol cannot be empty.")
+
+    if limit <= 0:
+        raise ValueError("Limit must be greater than zero.")
+
     params = {
-        "symbol": symbol,
+        "symbol": symbol.upper(),
         "interval": interval,
-        "limit": limit
+        "limit": int(limit),
     }
 
     try:
-        response = requests.get(
-            api_url,
+        response = SESSION.get(
+            config.MEXC_API_URL,
             params=params,
-            headers={"User-Agent": "Mozilla/5.0"}, # Mimic browser for potential API restrictions
-            timeout=10 # Set a timeout for the request
+            timeout=getattr(config, "MEXC_REQUEST_TIMEOUT", 10),
         )
-        response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
+
+        response.raise_for_status()
 
         data = response.json()
 
         if not isinstance(data, list):
-            raise ValueError(f"Unexpected API response format for {symbol}: Expected a list, got {type(data)}")
+            raise ValueError(
+                f"Unexpected MEXC response for {symbol} {interval}: "
+                f"expected list, got {type(data).__name__}"
+            )
 
         if not data:
-            logger.warning(f"No kline data received from MEXC for {symbol} with interval {interval}.")
-            return pd.DataFrame() # Return empty DataFrame if no data
+            logger.warning(
+                f"{symbol}: MEXC returned no data for interval={interval}"
+            )
+            return pd.DataFrame()
 
-        # Define column names based on Binance/MEXC kline structure
+        # MEXC kline response:
+        # [
+        #   open_time,
+        #   open,
+        #   high,
+        #   low,
+        #   close,
+        #   volume,
+        #   close_time,
+        #   quote_asset_volume,
+        #   ...
+        # ]
+
         column_names = [
-            "timestamp", "open", "high", "low", "close", "volume",
-            "close_time", "qav" # quote asset volume
-            # "ignore1", "ignore2", "ignore3", "ignore4" # Sometimes extra fields are present
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "close_time",
+            "qav",
         ]
-        
-        # Ensure we only take the expected number of columns
-        df = pd.DataFrame(data, columns=column_names[:len(data[0])])
 
-        # Convert relevant columns to numeric types
-        numeric_columns = ["open", "high", "low", "close", "volume", "qav"]
-        for col in numeric_columns:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col])
-            else:
-                logger.warning(f"Numeric column '{col}' not found in MEXC response for {symbol}.")
+        # Only keep the columns we actually use.
+        rows = [
+            row[:len(column_names)]
+            for row in data
+            if isinstance(row, (list, tuple))
+        ]
 
-        # Convert timestamp columns to datetime objects with UTC timezone
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-        df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+        if not rows:
+            raise ValueError(
+                f"Invalid kline rows returned for {symbol} {interval}"
+            )
 
-        # Filter out the currently-forming (incomplete) candle
+        df = pd.DataFrame(
+            rows,
+            columns=column_names[:len(rows[0])]
+        )
+
+        required_columns = [
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "close_time",
+        ]
+
+        missing_columns = [
+            col for col in required_columns
+            if col not in df.columns
+        ]
+
+        if missing_columns:
+            raise ValueError(
+                f"Missing columns for {symbol} {interval}: "
+                f"{missing_columns}"
+            )
+
+        # --------------------------------------------------------
+        # Numeric conversion
+        # --------------------------------------------------------
+
+        numeric_columns = [
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "qav",
+        ]
+
+        for column in numeric_columns:
+            if column in df.columns:
+                df[column] = pd.to_numeric(
+                    df[column],
+                    errors="coerce"
+                )
+
+        # --------------------------------------------------------
+        # Timestamp conversion
+        # --------------------------------------------------------
+
+        df["timestamp"] = pd.to_datetime(
+            df["timestamp"],
+            unit="ms",
+            utc=True,
+            errors="coerce",
+        )
+
+        df["close_time"] = pd.to_datetime(
+            df["close_time"],
+            unit="ms",
+            utc=True,
+            errors="coerce",
+        )
+
+        # Remove malformed rows.
+        df.dropna(
+            subset=[
+                "timestamp",
+                "close_time",
+                "open",
+                "high",
+                "low",
+                "close",
+            ],
+            inplace=True,
+        )
+
+        # --------------------------------------------------------
+        # Only closed candles
+        # --------------------------------------------------------
+
         now_utc = datetime.now(timezone.utc)
-        df = df[df["close_time"] <= now_utc].copy() # Use .copy() to avoid SettingWithCopyWarning
 
-        # Reset index to ensure clean DataFrame after filtering
-        df.reset_index(drop=True, inplace=True)
+        df = df[
+            df["close_time"] <= now_utc
+        ].copy()
 
-        logger.debug(f"Fetched {len(df)} closed candles for {symbol} ({interval}).")
+        # --------------------------------------------------------
+        # Sort / deduplicate
+        # --------------------------------------------------------
+
+        df.sort_values(
+            "timestamp",
+            inplace=True
+        )
+
+        df.drop_duplicates(
+            subset=["timestamp"],
+            keep="last",
+            inplace=True,
+        )
+
+        df.reset_index(
+            drop=True,
+            inplace=True
+        )
+
+        logger.debug(
+            f"MEXC: {symbol} {interval} -> "
+            f"{len(df)} closed candles"
+        )
+
         return df
 
-    except requests.exceptions.RequestException as e:
-        logger.error(f"HTTP request failed for {symbol} ({interval}): {e}")
-        raise # Re-raise the exception to be handled by the caller
-    except (ValueError, KeyError, IndexError) as e:
-        logger.error(f"Error processing MEXC kline data for {symbol} ({interval}): {e}")
-        # Potentially log response content here for debugging if needed
-        # logger.error(f"Response content: {response.text}")
-        raise ValueError(f"Failed to parse kline data for {symbol}.") from e
+    except requests.exceptions.RequestException as exc:
+        logger.error(
+            f"MEXC HTTP error: {symbol} {interval}: {exc}"
+        )
+        raise
 
-# Example of how to use this module (for testing purposes)
+    except (ValueError, TypeError, KeyError, IndexError) as exc:
+        logger.error(
+            f"MEXC data parsing error: "
+            f"{symbol} {interval}: {exc}"
+        )
+        raise ValueError(
+            f"Failed to parse MEXC data for "
+            f"{symbol} {interval}"
+        ) from exc
+
+    except Exception as exc:
+        logger.exception(
+            f"Unexpected MEXC error for "
+            f"{symbol} {interval}: {exc}"
+        )
+        raise
+
+
+# ============================================================
+# STANDALONE TEST
+# ============================================================
+
 if __name__ == "__main__":
-    # Configure basic logging for standalone testing
-    logging.basicConfig(level=logging.DEBUG, format=config.LOGGING_FORMAT, datefmt="%Y-%m-%d %H:%M:%S")
-    
-    test_symbol = "BTCUSDT"
-    test_interval = "60m"
-    test_limit = 200
 
-    try:
-        logger.info(f"Testing data fetching for {test_symbol} ({test_interval})...")
-        klines_df = fetch_mexc_klines(test_symbol, test_interval, test_limit)
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format=config.LOGGING_FORMAT,
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
-        if not klines_df.empty:
-            logger.info(f"Successfully fetched {len(klines_df)} closed candles.")
-            print("\nSample Data:")
-            print(klines_df.head())
-            print("\nDataFrame Info:")
-            klines_df.info()
-        else:
-            logger.warning("No data fetched.")
+    for test_symbol in ["BTCUSDT", "PAXGUSDT"]:
 
-    except Exception as e:
-        logger.error(f"Test failed: {e}")
+        try:
+            logger.info(
+                f"Testing {test_symbol}..."
+            )
+
+            df = fetch_mexc_klines(
+                symbol=test_symbol,
+                interval="60m",
+                limit=10,
+            )
+
+            if df.empty:
+                logger.warning(
+                    f"No data received for {test_symbol}"
+                )
+            else:
+                logger.info(
+                    f"{test_symbol}: "
+                    f"{len(df)} candles received"
+                )
+                print(df.tail())
+
+        except Exception as exc:
+            logger.error(
+                f"Test failed for {test_symbol}: {exc}"
+            )
