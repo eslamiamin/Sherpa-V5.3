@@ -1,74 +1,16 @@
-"""
-Configuration module for SHERPA V5.3.
-
-Loads environment variables and defines:
-- Runtime settings
-- Market data settings
-- Telegram settings
-- Risk management
-- Trade management
-- Versioning
-"""
-
-import logging
 import os
-
-from dotenv import load_dotenv
-from zoneinfo import ZoneInfo
-
+from datetime import timezone
 
 # ============================================================
-# ENVIRONMENT
+# BOT
 # ============================================================
 
-load_dotenv()
-
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-LOGGING_LEVEL = logging.INFO
-
-LOGGING_FORMAT = (
-    "%(asctime)s - "
-    "%(levelname)s - "
-    "%(name)s - "
-    "%(message)s"
-)
-
+BOT_VERSION = "SHERPA_V5.3"
+STRATEGY_VERSION = "EMA50-CROSS-V1"
 
 # ============================================================
-# TIMEZONES
+# MARKET
 # ============================================================
-
-TIMEZONE_UTC = ZoneInfo("UTC")
-TIMEZONE_TEHRAN = ZoneInfo("Asia/Tehran")
-
-
-# ============================================================
-# BOT RUNTIME
-# ============================================================
-
-SYMBOL_DELAY_SECONDS = 2.0
-
-LOOP_DELAY_SECONDS = 60.0
-
-MAX_CONCURRENT_POSITIONS = 5
-
-
-# ============================================================
-# MARKET DATA
-# ============================================================
-
-HOURLY_CANDLE_LIMIT = 300
-
-DAILY_CANDLE_LIMIT = 250
-
-MEXC_API_URL = (
-    "https://api.mexc.com/api/v3/klines"
-)
-
 
 SYMBOLS = [
     "BTCUSDT",
@@ -77,173 +19,158 @@ SYMBOLS = [
     "BNBUSDT",
     "AVAXUSDT",
     "NEARUSDT",
+    "PAXGUSDT",
 ]
 
+MAIN_TIMEFRAME = "1h"
+REGIME_TIMEFRAME = "1d"
+
+# ============================================================
+# CAPITAL & RISK
+# ============================================================
+
+INITIAL_CAPITAL = 1000.0
+
+# Maximum notional value of one position
+MAX_POSITION_NOTIONAL_PCT = 0.25
+
+# Maximum number of simultaneous open positions
+MAX_CONCURRENT_POSITIONS = 5
+
+# Risk per trade
+STRONG_REGIME_RISK_PCT = 0.025   # 2.5%
+NORMAL_REGIME_RISK_PCT = 0.01    # 1%
+
+# ============================================================
+# ATR / TRADE MANAGEMENT
+# ============================================================
+
+TP_ATR_MULTIPLIER = 2.0
+SL_ATR_MULTIPLIER = 1.2
+
+# Move SL to entry after reaching 50% of TP distance
+BREAK_EVEN_TRIGGER_RATIO = 0.50
+
+# Lock 25% of original TP distance after reaching 80% of TP
+PROFIT_LOCK_TRIGGER_RATIO = 0.80
+PROFIT_LOCK_SL_RATIO = 0.25
+
+# ============================================================
+# INDICATORS
+# ============================================================
+
+EMA_FAST_PERIOD = 5
+EMA_SIGNAL_PERIOD = 15
+EMA_50_PERIOD = 50
+EMA_200_PERIOD = 200
+
+RSI_PERIOD = 14
+ATR_PERIOD = 14
+ADX_PERIOD = 14
+MFI_PERIOD = 14
+BB_PERIOD = 20
+BB_STD = 2.0
+VOLUME_SMA_PERIOD = 20
+
+# ============================================================
+# REGIME THRESHOLDS
+# ============================================================
+
+ADX_DEAD_CHOP = 18.0
+ADX_STRONG_TREND = 30.0
+
+BB_WIDTH_DEAD_CHOP = 0.02
+
+# ============================================================
+# SIGNAL THRESHOLDS
+# ============================================================
+
+# Trend entries
+BULL_RSI_MIN = 55.0
+BEAR_RSI_MAX = 45.0
+
+# Range entries
+RANGE_RSI_LONG_MAX = 35.0
+RANGE_RSI_SHORT_MIN = 65.0
+
+RANGE_MFI_LONG_MAX = 30.0
+RANGE_MFI_SHORT_MIN = 70.0
+
+# ============================================================
+# TIMING / LOOP
+# ============================================================
+
+# Main loop runs every 5 minutes.
+LOOP_DELAY_SECONDS = 300.0
+
+# Small delay between symbol requests.
+SYMBOL_DELAY_SECONDS = 2.0
+
+# Daily market data refresh interval.
+DAILY_DATA_REFRESH_HOURS = 4
+
+# MEXC HTTP timeout
+MEXC_REQUEST_TIMEOUT = 10
+
+# Telegram HTTP timeout
+TELEGRAM_REQUEST_TIMEOUT = 10
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN"
-)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-TELEGRAM_PERSONAL_CHAT_ID = os.getenv(
-    "TELEGRAM_PERSONAL_CHAT_ID"
-)
-
-TELEGRAM_CHANNEL_CHAT_ID = os.getenv(
-    "TELEGRAM_CHANNEL_CHAT_ID"
-)
-
-TELEGRAM_API_URL = (
-    "https://api.telegram.org/"
-    "bot{token}/sendMessage"
-)
-
-# HTTP timeout for Telegram requests.
-TELEGRAM_REQUEST_TIMEOUT = 10
-
+# Optional separate channel.
+TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "")
 
 # ============================================================
-# PAPER TRADING
+# TIMEZONES
 # ============================================================
 
-INITIAL_CAPITAL = 1000.0
+TIMEZONE_UTC = timezone.utc
 
+# Tehran timezone.
+# Using a fixed offset avoids requiring an external timezone package.
+from datetime import timedelta
 
-# Maximum notional allocation per position.
-# Example:
-# $1000 capital × 25% = maximum $250 position.
-MAX_POSITION_NOTIONAL_PCT = 0.25
-
-
-# ============================================================
-# RISK MANAGEMENT
-# ============================================================
-
-# Strong market regime:
-# 2.5% of capital at risk per trade.
-STRONG_REGIME_RISK_PCT = 0.025
-
-
-# Normal market regime:
-# 1% of capital at risk per trade.
-NORMAL_REGIME_RISK_PCT = 0.01
-
+TIMEZONE_TEHRAN = timezone(timedelta(hours=3, minutes=30))
 
 # ============================================================
-# TP / SL
+# REPORTING
 # ============================================================
 
-TP_ATR_MULTIPLIER = 2.0
+# Daily journal hour in UTC.
+DAILY_REPORT_UTC_HOUR = 23
 
-SL_ATR_MULTIPLIER = 1.2
-
-
-# ============================================================
-# POSITION MANAGEMENT
-# ============================================================
-
-# When price reaches 50% of the original TP distance:
-# move SL to entry.
-BREAK_EVEN_TRIGGER_RATIO = 0.50
-
-
-# When price reaches 80% of the original TP distance:
-# lock 25% of the original TP distance.
-PROFIT_LOCK_TRIGGER_RATIO = 0.80
-
-
-# Example:
-# Entry = 100
-# TP = 110
-# Original TP distance = 10
-# Profit lock SL = 102.5
-PROFIT_LOCK_SL_RATIO = 0.25
-
+# 4-hour report schedule.
+REPORT_INTERVAL_HOURS = 4
 
 # ============================================================
-# VERSIONING
+# NEWS
 # ============================================================
 
-BOT_VERSION = "SHERPA_V5.3"
-
-STRATEGY_VERSION = "EMA50-CROSS-V1"
-
+NEWS_ENABLED = False
 
 # ============================================================
-# HELPERS
+# VALIDATION
 # ============================================================
 
-def get_env_variable(
-    var_name: str,
-    default: str | None = None,
-) -> str | None:
+if INITIAL_CAPITAL <= 0:
+    raise ValueError("INITIAL_CAPITAL must be greater than zero")
 
-    value = os.getenv(
-        var_name,
-        default,
-    )
+if not 0 < MAX_POSITION_NOTIONAL_PCT <= 1:
+    raise ValueError("MAX_POSITION_NOTIONAL_PCT must be between 0 and 1")
 
-    if not value and default is None:
+if not 0 < STRONG_REGIME_RISK_PCT <= 1:
+    raise ValueError("STRONG_REGIME_RISK_PCT must be between 0 and 1")
 
-        logging.warning(
-            "Environment variable '%s' is not set.",
-            var_name,
-        )
+if not 0 < NORMAL_REGIME_RISK_PCT <= 1:
+    raise ValueError("NORMAL_REGIME_RISK_PCT must be between 0 and 1")
 
-    return value
+if TP_ATR_MULTIPLIER <= 0:
+    raise ValueError("TP_ATR_MULTIPLIER must be greater than zero")
 
-
-def configure_logging():
-
-    logging.basicConfig(
-        level=LOGGING_LEVEL,
-        format=LOGGING_FORMAT,
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    logging.getLogger(
-        "urllib3"
-    ).setLevel(
-        logging.WARNING
-    )
-
-
-# ============================================================
-# INITIALIZATION
-# ============================================================
-
-configure_logging()
-
-
-# ============================================================
-# ENVIRONMENT VALIDATION
-# ============================================================
-
-missing_telegram_vars = []
-
-if not TELEGRAM_BOT_TOKEN:
-    missing_telegram_vars.append(
-        "TELEGRAM_BOT_TOKEN"
-    )
-
-if not TELEGRAM_PERSONAL_CHAT_ID:
-    missing_telegram_vars.append(
-        "TELEGRAM_PERSONAL_CHAT_ID"
-    )
-
-if not TELEGRAM_CHANNEL_CHAT_ID:
-    missing_telegram_vars.append(
-        "TELEGRAM_CHANNEL_CHAT_ID"
-    )
-
-
-if missing_telegram_vars:
-
-    logging.warning(
-        "Missing Telegram environment variables: %s. "
-        "Telegram notifications may not work.",
-        ", ".join(missing_telegram_vars),
-    )
+if SL_ATR_MULTIPLIER <= 0:
+    raise ValueError("SL_ATR_MULTIPLIER must be greater than zero")
