@@ -1,4 +1,3 @@
-```python
 """
 Telegram Channel Messaging Module.
 
@@ -666,4 +665,3 @@ def publish_news_alerts() -> None:
         "NEWS_ENABLED=True but no real news provider "
         "is implemented."
     )
-```
