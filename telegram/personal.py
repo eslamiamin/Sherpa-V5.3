@@ -11,7 +11,7 @@ suitable for direct import into Excel or Power Query for performance analysis.
 
 import logging
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Any
 
 import config
