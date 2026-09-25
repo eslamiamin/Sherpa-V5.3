@@ -1,16 +1,19 @@
 """
-Telegram channel messaging module for SHERPA V5.3.
+Telegram Channel Messaging Module.
 
-The channel is used for:
-- New trading signals
+Handles:
+- Trading signals
 - Trade status updates
 - Market pulse
-- Session alerts
+- Trading session alerts
+- News alerts placeholder
+
+Paper trading only.
 """
 
 import logging
-from datetime import datetime, timezone
-from typing import Dict, Any, List
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Any
 
 import requests
 
@@ -21,16 +24,25 @@ from telegram.personal import (
     format_trade_line,
 )
 
+
 logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# CONFIG
+# TELEGRAM CONFIG
 # ============================================================
 
-CHANNEL_CHAT_ID = config.TELEGRAM_CHANNEL_ID
-BOT_TOKEN = config.TELEGRAM_BOT_TOKEN
+ADVISOR_BOT_TOKEN = config.TELEGRAM_BOT_TOKEN
 
+CHANNEL_CHAT_ID = config.TELEGRAM_CHANNEL_CHAT_ID
+
+
+# ============================================================
+# SIGNAL SESSION FILTER
+# ============================================================
+
+# False = every valid strategy signal can be published.
+# The strategy itself decides whether a trade should exist.
 SIGNAL_ONLY_ACTIVE_SESSIONS = False
 
 ACTIVE_SESSIONS = [
@@ -40,7 +52,7 @@ ACTIVE_SESSIONS = [
 
 
 # ============================================================
-# TELEGRAM
+# TELEGRAM SENDER
 # ============================================================
 
 def send_telegram_message(
@@ -51,13 +63,12 @@ def send_telegram_message(
 
     if not bot_token or not chat_id:
         logger.warning(
-            "Telegram channel token or chat ID is not configured."
+            "Telegram Bot Token or Chat ID is not configured."
         )
         return False
 
-    url = (
-        "https://api.telegram.org/"
-        f"bot{bot_token}/sendMessage"
+    url = config.TELEGRAM_API_URL.format(
+        token=bot_token
     )
 
     payload = {
@@ -72,18 +83,24 @@ def send_telegram_message(
             json=payload,
             timeout=config.TELEGRAM_REQUEST_TIMEOUT,
         )
+
         response.raise_for_status()
+
+        logger.debug(
+            "Telegram message sent successfully."
+        )
+
         return True
 
     except requests.exceptions.RequestException as exc:
         logger.error(
-            f"Telegram channel request failed: {exc}"
+            f"Failed to send Telegram message: {exc}"
         )
         return False
 
     except Exception as exc:
         logger.exception(
-            f"Unexpected Telegram channel error: {exc}"
+            f"Unexpected Telegram error: {exc}"
         )
         return False
 
@@ -145,35 +162,43 @@ def publish_trading_signal(
         profit_lock_triggered=False,
     )
 
-    icon = (
+    direction_icon = (
         "🟢"
         if side == "LONG"
         else "🔴"
     )
 
     message = (
-        f"🚨 *NEW TRADING SIGNAL — {icon} {side}*\n\n"
+        f"🚨 *NEW TRADING SIGNAL — "
+        f"{direction_icon} {side}*\n\n"
         f"*Asset:* `{symbol}`\n"
         f"*Entry:* `{entry_price:.6g}`\n"
         f"*Stop Loss:* `{stop_price:.6g}`\n"
         f"*Take Profit:* `{tp_price:.6g}`\n"
         f"*Risk:* `{risk_pct * 100:.1f}%`\n"
-        f"*Position Size:* `${position_size_usd:.2f}`\n"
+        f"*Position Size:* "
+        f"`${position_size_usd:.2f}`\n"
         f"*Regime:* `{regime}`\n"
         f"*Strategy:* `{strategy_version}`\n\n"
         f"🕒 {timestamp}\n\n"
         f"`{trade_line}`"
     )
 
-    send_telegram_message(
+    success = send_telegram_message(
         message,
         CHANNEL_CHAT_ID,
-        BOT_TOKEN,
+        ADVISOR_BOT_TOKEN,
     )
+
+    if success:
+        logger.info(
+            f"Published trading signal: "
+            f"{symbol} {side} | {trade_id}"
+        )
 
 
 # ============================================================
-# STATUS UPDATE
+# TRADE STATUS UPDATE
 # ============================================================
 
 def publish_status_update(
@@ -192,6 +217,10 @@ def publish_status_update(
         timestamp_utc
     )
 
+    # --------------------------------------------------------
+    # BREAK-EVEN
+    # --------------------------------------------------------
+
     if status_type == "BREAK_EVEN":
 
         message = (
@@ -208,6 +237,10 @@ def publish_status_update(
             f"🕒 {timestamp}"
         )
 
+    # --------------------------------------------------------
+    # PROFIT LOCK
+    # --------------------------------------------------------
+
     elif status_type == "PROFIT_LOCK":
 
         message = (
@@ -221,6 +254,10 @@ def publish_status_update(
             f"`{details.get('current_price', 0.0):.6g}`\n\n"
             f"🕒 {timestamp}"
         )
+
+    # --------------------------------------------------------
+    # TRADE CLOSED
+    # --------------------------------------------------------
 
     elif status_type == "TRADE_CLOSED":
 
@@ -258,7 +295,9 @@ def publish_status_update(
                 "entry",
                 0.0,
             ),
-            tp=details.get("tp"),
+            tp=details.get(
+                "tp"
+            ),
             position_size_usd=details.get(
                 "size_usd",
                 0.0,
@@ -291,14 +330,23 @@ def publish_status_update(
         )
 
         pnl = float(
-            details.get("pnl_usd", 0.0)
+            details.get(
+                "pnl_usd",
+                0.0,
+            )
+        )
+
+        icon = (
+            "🎯"
+            if pnl >= 0
+            else "🛑"
         )
 
         message = (
-            f"{'🎯' if pnl >= 0 else '🛑'} "
-            f"*TRADE CLOSED — {symbol}*\n\n"
+            f"{icon} *TRADE CLOSED — {symbol}*\n\n"
             f"*Trade ID:* `{trade_id}`\n"
-            f"*Side:* `{details.get('side', 'N/A')}`\n"
+            f"*Side:* "
+            f"`{details.get('side', 'N/A')}`\n"
             f"*Entry:* "
             f"`{details.get('entry', 0.0):.6g}`\n"
             f"*Exit:* "
@@ -316,14 +364,15 @@ def publish_status_update(
 
     else:
         logger.warning(
-            f"Unknown status type: {status_type}"
+            f"Unknown Telegram status type: "
+            f"{status_type}"
         )
         return
 
     send_telegram_message(
         message,
         CHANNEL_CHAT_ID,
-        BOT_TOKEN,
+        ADVISOR_BOT_TOKEN,
     )
 
 
@@ -336,6 +385,9 @@ def publish_market_pulse(
 ) -> None:
 
     if not asset_data:
+        logger.warning(
+            "No asset data provided for market pulse."
+        )
         return
 
     timestamp = format_timestamp_message(
@@ -347,11 +399,11 @@ def publish_market_pulse(
         "WEAK_BULL": "Weak Bull",
         "STRONG_BEAR": "Strong Bear",
         "WEAK_BEAR": "Weak Bear",
-        "GOOD_RANGE": "Range",
+        "GOOD_RANGE": "Good Range",
         "DEAD_CHOP": "Dead Chop",
     }
 
-    parts = [
+    message_parts = [
         "📊 *MARKET PULSE*\n\n",
         f"🕒 {timestamp}\n\n",
     ]
@@ -363,26 +415,59 @@ def publish_market_pulse(
             "UNKNOWN",
         )
 
-        regime_text = regime_map.get(
+        regime_description = regime_map.get(
             regime,
             regime,
         )
 
-        parts.append(
+        message_parts.append(
             f"*{symbol}*\n"
-            f"• Price: `{data.get('price', 0.0):.6g}`\n"
-            f"• RSI: `{data.get('rsi', 0.0):.1f}`\n"
-            f"• 4H: `{data.get('change_4h', 0.0):+.2f}%`\n"
-            f"• 1D: `{data.get('change_1d', 0.0):+.2f}%`\n"
-            f"• 1W: `{data.get('change_1w', 0.0):+.2f}%`\n"
-            f"• Regime: `{regime_text}`\n\n"
+            f"• Price: "
+            f"`{data.get('price', 0.0):.6g}`\n"
+            f"• RSI: "
+            f"`{data.get('rsi', 0.0):.1f}`\n"
+            f"• 4H: "
+            f"`{data.get('change_4h', 0.0):+.2f}%`\n"
+            f"• 1D: "
+            f"`{data.get('change_1d', 0.0):+.2f}%`\n"
+            f"• 1W: "
+            f"`{data.get('change_1w', 0.0):+.2f}%`\n"
+            f"• Regime: "
+            f"`{regime_description}`\n\n"
         )
 
     send_telegram_message(
-        "".join(parts),
+        "".join(message_parts),
         CHANNEL_CHAT_ID,
-        BOT_TOKEN,
+        ADVISOR_BOT_TOKEN,
     )
+
+
+# ============================================================
+# SESSION TIMES
+# ============================================================
+
+SESSION_TIMES = {
+    "Tokyo": {
+        "start_utc": (1, 0),
+        "end_utc": (8, 0),
+    },
+    "London": {
+        "start_utc": (8, 0),
+        "end_utc": (17, 0),
+    },
+    "New York": {
+        "start_utc": (13, 0),
+        "end_utc": (22, 0),
+    },
+}
+
+
+# Keep track of the last alert per session/date.
+last_session_alert_sent: Dict[
+    tuple,
+    datetime,
+] = {}
 
 
 # ============================================================
@@ -396,7 +481,8 @@ def publish_session_alert(
 ) -> None:
 
     message = (
-        f"⏳ *TRADING SESSION — {session_name}*\n\n"
+        f"⏳ *TRADING SESSION — "
+        f"{session_name}*\n\n"
         f"*Start:* "
         f"`{format_timestamp_message(start_time_utc)}`\n"
         f"*End:* "
@@ -406,110 +492,143 @@ def publish_session_alert(
     send_telegram_message(
         message,
         CHANNEL_CHAT_ID,
-        BOT_TOKEN,
+        ADVISOR_BOT_TOKEN,
     )
 
 
-# ============================================================
-# SESSION DETECTION
-# ============================================================
-
-SESSION_TIMES = {
-    "Tokyo": (1, 8),
-    "London": (8, 17),
-    "New York": (13, 22),
-}
-
-
-def get_current_session(
-    timestamp_utc: datetime | None = None,
-) -> str:
-
-    if timestamp_utc is None:
-        timestamp_utc = datetime.now(
-            timezone.utc
-        )
-
-    hour = timestamp_utc.hour
-
-    for session_name, (
-        start_hour,
-        end_hour,
-    ) in SESSION_TIMES.items():
-
-        if start_hour <= hour < end_hour:
-            return session_name
-
-    return "Off-Session"
-
-
-def is_current_session_active(
-    active_sessions: List[str],
-) -> bool:
-
-    current_session = get_current_session()
-
-    return current_session in active_sessions
-
-
-# ============================================================
-# SESSION ALERT SCHEDULER
-# ============================================================
-
-_last_session_alert_key = None
-
-
 def check_and_publish_session_alerts(
-    now_utc: datetime | None = None,
+    current_time_utc: datetime,
 ) -> None:
 
-    global _last_session_alert_key
-
-    if now_utc is None:
-        now_utc = datetime.now(
+    if current_time_utc.tzinfo is None:
+        current_time_utc = current_time_utc.replace(
+            tzinfo=timezone.utc
+        )
+    else:
+        current_time_utc = current_time_utc.astimezone(
             timezone.utc
         )
 
-    for session_name, (
-        start_hour,
-        end_hour,
-    ) in SESSION_TIMES.items():
+    for session_name, times in SESSION_TIMES.items():
 
+        start_hour, start_minute = (
+            times["start_utc"]
+        )
+
+        end_hour, end_minute = (
+            times["end_utc"]
+        )
+
+        session_start_utc = datetime(
+            current_time_utc.year,
+            current_time_utc.month,
+            current_time_utc.day,
+            start_hour,
+            start_minute,
+            tzinfo=timezone.utc,
+        )
+
+        session_end_utc = datetime(
+            current_time_utc.year,
+            current_time_utc.month,
+            current_time_utc.day,
+            end_hour,
+            end_minute,
+            tzinfo=timezone.utc,
+        )
+
+        if session_end_utc <= session_start_utc:
+            session_end_utc += timedelta(
+                days=1
+            )
+
+        # Alert once during the first 5 minutes
+        # of the session.
         if (
-            now_utc.hour == start_hour
-            and now_utc.minute < 5
+            session_start_utc
+            <= current_time_utc
+            < session_start_utc + timedelta(minutes=5)
         ):
 
             alert_key = (
                 session_name,
-                now_utc.date(),
-                "START",
+                session_start_utc.date(),
             )
 
-            if alert_key == _last_session_alert_key:
+            if alert_key in last_session_alert_sent:
                 continue
-
-            start_time = now_utc.replace(
-                hour=start_hour,
-                minute=0,
-                second=0,
-                microsecond=0,
-            )
-
-            end_time = now_utc.replace(
-                hour=end_hour,
-                minute=0,
-                second=0,
-                microsecond=0,
-            )
 
             publish_session_alert(
                 session_name,
-                start_time,
-                end_time,
+                session_start_utc,
+                session_end_utc,
             )
 
-            _last_session_alert_key = alert_key
+            last_session_alert_sent[
+                alert_key
+            ] = current_time_utc
+
+
+# ============================================================
+# SESSION CHECK
+# ============================================================
+
+def is_current_session_active(
+    target_sessions: List[str],
+) -> bool:
+
+    now_utc = datetime.now(
+        timezone.utc
+    )
+
+    for session_name in target_sessions:
+
+        if session_name not in SESSION_TIMES:
+            continue
+
+        times = SESSION_TIMES[
+            session_name
+        ]
+
+        start_hour, start_minute = (
+            times["start_utc"]
+        )
+
+        end_hour, end_minute = (
+            times["end_utc"]
+        )
+
+        session_start_utc = datetime(
+            now_utc.year,
+            now_utc.month,
+            now_utc.day,
+            start_hour,
+            start_minute,
+            tzinfo=timezone.utc,
+        )
+
+        session_end_utc = datetime(
+            now_utc.year,
+            now_utc.month,
+            now_utc.day,
+            end_hour,
+            end_minute,
+            tzinfo=timezone.utc,
+        )
+
+        if session_end_utc <= session_start_utc:
+            session_end_utc += timedelta(
+                days=1
+            )
+
+        if (
+            session_start_utc
+            <= now_utc
+            < session_end_utc
+        ):
+            return True
+
+    return False
 
 
 # ============================================================
@@ -518,8 +637,16 @@ def check_and_publish_session_alerts(
 
 def publish_news_alerts() -> None:
     """
-    Placeholder for future news integration.
+    News integration is intentionally disabled.
 
-    Disabled for now to avoid unnecessary external API calls.
+    The current project does not have a real external news
+    provider connected, so no fake news should be published.
     """
-    return
+
+    if not config.NEWS_ENABLED:
+        return
+
+    logger.warning(
+        "NEWS_ENABLED=True but no real news provider "
+        "is implemented."
+    )
