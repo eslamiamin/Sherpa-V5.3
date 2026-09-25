@@ -1,297 +1,829 @@
 """
-Technical Indicators for SHERPA V5.3.
+Main Execution Module for SHERPA V5.3 Trading Bot.
+
+Responsibilities:
+- Fetch market data.
+- Cache daily/hourly data.
+- Calculate indicators.
+- Detect market regime.
+- Generate signals.
+- Manage open positions.
+- Open new paper trades.
+- Publish Telegram notifications.
+- Run scheduled reports.
+- Keep Render service alive.
+
+Paper trading only.
 """
 
 import logging
-import pandas as pd
+import os
+import time
+import threading
+from datetime import datetime, timezone
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from typing import Dict, Any, Optional
+
+import config
+import trading.engine as engine
+
+from data.mexc import fetch_mexc_klines
+from strategy.indicators import calculate_indicators
+from strategy.strategy import (
+    detect_market_regime,
+    generate_signals,
+)
+
+from telegram.personal import (
+    send_to_personal_chat,
+    format_4h_report,
+    format_daily_journal,
+)
+
+from telegram.channel import (
+    publish_trading_signal,
+    check_and_publish_session_alerts,
+    publish_news_alerts,
+)
+
 
 logger = logging.getLogger(__name__)
 
-EMA_SHORT_PERIOD = 5
-EMA_MEDIUM_PERIOD = 15
-EMA_50_PERIOD = 50
-EMA_200_PERIOD = 200
 
-RSI_PERIOD = 14
-ATR_PERIOD = 14
-BB_PERIOD = 20
-BB_STD_DEV = 2
+# ============================================================
+# CACHE
+# ============================================================
 
-ADX_PERIOD = 14
-MFI_PERIOD = 14
-VOL_SMA_PERIOD = 20
+market_cache: Dict[str, Dict[str, Any]] = {}
+
+last_hourly_candle: Dict[str, Any] = {}
+last_daily_refresh: Optional[datetime] = None
+
+last_4h_report_key: Optional[str] = None
+last_daily_report_date: Optional[str] = None
+
+# Prevent processing the same 1H candle repeatedly.
+last_entry_signal_candle: Dict[str, Any] = {}
 
 
-def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+# ============================================================
+# RENDER KEEP-ALIVE
+# ============================================================
 
-    if df is None or df.empty:
-        return pd.DataFrame()
+class DummyServer(BaseHTTPRequestHandler):
 
-    required = [
-        "timestamp",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-    ]
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(
+            b"SHERPA V5.3 Bot is alive and running!"
+        )
 
-    if not all(col in df.columns for col in required):
-        logger.warning("Missing required OHLCV columns.")
-        return pd.DataFrame()
+    def log_message(self, format, *args):
+        pass
 
-    df = df.copy()
 
-    df = df.sort_values("timestamp").reset_index(drop=True)
-
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # ========================================================
-    # EMA
-    # ========================================================
-
-    df["ema_5"] = df["close"].ewm(
-        span=EMA_SHORT_PERIOD,
-        adjust=False,
-    ).mean()
-
-    df["ema_15"] = df["close"].ewm(
-        span=EMA_MEDIUM_PERIOD,
-        adjust=False,
-    ).mean()
-
-    df["ema_50"] = df["close"].ewm(
-        span=EMA_50_PERIOD,
-        adjust=False,
-    ).mean()
-
-    df["ema_200"] = df["close"].ewm(
-        span=EMA_200_PERIOD,
-        adjust=False,
-    ).mean()
-
-    # ========================================================
-    # RSI
-    # ========================================================
-
-    delta = df["close"].diff()
-
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.ewm(
-        alpha=1 / RSI_PERIOD,
-        adjust=False,
-        min_periods=RSI_PERIOD,
-    ).mean()
-
-    avg_loss = loss.ewm(
-        alpha=1 / RSI_PERIOD,
-        adjust=False,
-        min_periods=RSI_PERIOD,
-    ).mean()
-
-    rs = avg_gain / avg_loss.replace(0, pd.NA)
-
-    df["rsi"] = 100 - (
-        100 / (1 + rs)
+def run_keep_alive_server():
+    port = int(
+        os.getenv("PORT", "8080")
     )
 
-    # If there is no loss, RSI is effectively 100.
-    df.loc[
-        (avg_loss == 0) & (avg_gain > 0),
-        "rsi",
-    ] = 100.0
+    try:
+        server = HTTPServer(
+            ("0.0.0.0", port),
+            DummyServer,
+        )
 
-    # ========================================================
-    # ATR
-    # ========================================================
+        logger.info(
+            f"Render keep-alive server running on port {port}"
+        )
 
-    previous_close = df["close"].shift(1)
+        server.serve_forever()
 
-    tr_components = pd.concat(
-        [
-            df["high"] - df["low"],
-            (df["high"] - previous_close).abs(),
-            (df["low"] - previous_close).abs(),
-        ],
-        axis=1,
+    except Exception as exc:
+        logger.exception(
+            f"Keep-alive server failed: {exc}"
+        )
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def percentage_change(
+    current: float,
+    previous: float,
+) -> float:
+
+    if previous == 0:
+        return 0.0
+
+    return (
+        (current - previous)
+        / previous
+        * 100.0
     )
 
-    true_range = tr_components.max(axis=1)
 
-    df["atr"] = true_range.ewm(
-        alpha=1 / ATR_PERIOD,
-        adjust=False,
-        min_periods=ATR_PERIOD,
-    ).mean()
+def should_refresh_daily_data(
+    now_utc: datetime,
+) -> bool:
 
-    # ========================================================
-    # Bollinger Bands
-    # ========================================================
+    global last_daily_refresh
 
-    df["bb_middle"] = df["close"].rolling(
-        BB_PERIOD,
-        min_periods=BB_PERIOD,
-    ).mean()
+    if last_daily_refresh is None:
+        return True
 
-    bb_std = df["close"].rolling(
-        BB_PERIOD,
-        min_periods=BB_PERIOD,
-    ).std()
+    elapsed_seconds = (
+        now_utc - last_daily_refresh
+    ).total_seconds()
 
-    df["bb_upper"] = (
-        df["bb_middle"]
-        + BB_STD_DEV * bb_std
+    # Daily regime data does not need refreshing every 5 minutes.
+    return elapsed_seconds >= 4 * 60 * 60
+
+
+# ============================================================
+# FETCH + PROCESS ONE SYMBOL
+# ============================================================
+
+def fetch_and_process_symbol(
+    symbol: str,
+    refresh_daily: bool,
+) -> Optional[Dict[str, Any]]:
+
+    try:
+
+        # ----------------------------------------------------
+        # 1. Hourly data
+        # ----------------------------------------------------
+
+        df_1h = fetch_mexc_klines(
+            symbol=symbol,
+            interval="60m",
+            limit=config.HOURLY_CANDLE_LIMIT,
+        )
+
+        if df_1h.empty:
+            logger.warning(
+                f"{symbol}: empty hourly data"
+            )
+            return None
+
+        # ----------------------------------------------------
+        # 2. Daily data
+        # ----------------------------------------------------
+
+        cached = market_cache.get(symbol)
+
+        if (
+            not refresh_daily
+            and cached is not None
+            and cached.get("df_1d") is not None
+        ):
+            df_1d = cached["df_1d"]
+
+        else:
+
+            df_1d = fetch_mexc_klines(
+                symbol=symbol,
+                interval="1d",
+                limit=config.DAILY_CANDLE_LIMIT,
+            )
+
+            if df_1d.empty:
+                logger.warning(
+                    f"{symbol}: empty daily data"
+                )
+                return None
+
+        # ----------------------------------------------------
+        # 3. Validate history
+        # ----------------------------------------------------
+
+        required_hourly = 205
+        required_daily = 55
+
+        if len(df_1h) < required_hourly:
+
+            logger.warning(
+                f"{symbol}: insufficient hourly data "
+                f"{len(df_1h)} < {required_hourly}"
+            )
+
+            return None
+
+        if len(df_1d) < required_daily:
+
+            logger.warning(
+                f"{symbol}: insufficient daily data "
+                f"{len(df_1d)} < {required_daily}"
+            )
+
+            return None
+
+        # ----------------------------------------------------
+        # 4. Indicators
+        # ----------------------------------------------------
+
+        df_1h_ind = calculate_indicators(
+            df_1h
+        )
+
+        df_1d_ind = calculate_indicators(
+            df_1d
+        )
+
+        if (
+            df_1h_ind.empty
+            or df_1d_ind.empty
+        ):
+            logger.warning(
+                f"{symbol}: indicator calculation failed"
+            )
+            return None
+
+        # ----------------------------------------------------
+        # 5. Latest candles
+        # ----------------------------------------------------
+
+        latest_hourly = df_1h_ind.iloc[-1]
+        latest_daily = df_1d_ind.iloc[-1]
+
+        candle_time = latest_hourly["timestamp"]
+
+        now_utc = datetime.now(timezone.utc)
+
+        price = float(
+            latest_hourly["close"]
+        )
+
+        atr = float(
+            latest_hourly["atr"]
+        )
+
+        # ----------------------------------------------------
+        # 6. Regime
+        # ----------------------------------------------------
+
+        regime = detect_market_regime(
+            df_1d_ind,
+            df_1h_ind,
+        )
+
+        # ----------------------------------------------------
+        # 7. Market snapshot
+        # ----------------------------------------------------
+
+        market_data = {
+            "symbol": symbol,
+
+            "price": price,
+
+            "high": float(
+                latest_hourly["high"]
+            ),
+
+            "low": float(
+                latest_hourly["low"]
+            ),
+
+            "rsi": float(
+                latest_hourly["rsi"]
+            ),
+
+            "atr": atr,
+
+            "regime": regime,
+
+            "change_4h": percentage_change(
+                price,
+                float(df_1h_ind.iloc[-5]["close"]),
+            ),
+
+            "change_1d": percentage_change(
+                price,
+                float(df_1h_ind.iloc[-25]["close"]),
+            ),
+
+            "change_1w": percentage_change(
+                price,
+                float(df_1h_ind.iloc[-169]["close"]),
+            ),
+
+            "candle_time": candle_time,
+
+            "timestamp_utc": now_utc,
+        }
+
+        # ----------------------------------------------------
+        # 8. Signal
+        # ----------------------------------------------------
+
+        signal = generate_signals(
+            df_1h_ind,
+            regime,
+            candle_time,
+        )
+
+        signal["strategy_version"] = (
+            config.STRATEGY_VERSION
+        )
+
+        # ----------------------------------------------------
+        # 9. Detect whether this is a new 1H candle
+        # ----------------------------------------------------
+
+        previous_candle = last_hourly_candle.get(
+            symbol
+        )
+
+        is_new_hourly_candle = (
+            previous_candle is None
+            or candle_time > previous_candle
+        )
+
+        last_hourly_candle[symbol] = candle_time
+
+        # ----------------------------------------------------
+        # 10. Store in cache
+        # ----------------------------------------------------
+
+        market_cache[symbol] = {
+            "df_1h": df_1h,
+            "df_1d": df_1d,
+            "df_1h_indicators": df_1h_ind,
+            "df_1d_indicators": df_1d_ind,
+            "market_data": market_data,
+            "signal": signal,
+            "is_new_hourly_candle": is_new_hourly_candle,
+            "fetched_at": now_utc,
+        }
+
+        return market_data
+
+    except Exception as exc:
+
+        logger.exception(
+            f"{symbol}: failed to process market data: {exc}"
+        )
+
+        return None
+
+
+# ============================================================
+# PROCESS NEW ENTRIES
+# ============================================================
+
+def process_new_entries(
+    current_capital: float,
+):
+    """
+    Process signals using already-fetched cached data.
+
+    No additional market API calls are made here.
+    """
+
+    for symbol in config.SYMBOLS:
+
+        if len(engine.open_positions) >= config.MAX_CONCURRENT_POSITIONS:
+            break
+
+        cached = market_cache.get(symbol)
+
+        if not cached:
+            continue
+
+        # Already have a position.
+        if symbol in engine.open_positions:
+            continue
+
+        # Only evaluate an entry once per new closed 1H candle.
+        if not cached.get("is_new_hourly_candle"):
+            continue
+
+        market_data = cached["market_data"]
+        signal = cached["signal"]
+
+        candle_time = market_data["candle_time"]
+
+        if (
+            last_entry_signal_candle.get(symbol)
+            == candle_time
+        ):
+            continue
+
+        # Mark as processed regardless of HOLD.
+        last_entry_signal_candle[symbol] = candle_time
+
+        if signal.get("action") == "HOLD":
+            continue
+
+        opened, position = engine.process_symbol_state(
+            symbol=symbol,
+            signal=signal,
+            market_data=market_data,
+            current_capital=current_capital,
+        )
+
+        if not opened or position is None:
+            continue
+
+        # ----------------------------------------------------
+        # Public channel
+        # ----------------------------------------------------
+
+        try:
+
+            publish_trading_signal(
+                symbol=symbol,
+                side=signal["action"],
+                entry_price=signal["entry_price"],
+                stop_price=signal["stop_price"],
+                tp_price=signal["take_profit_price"],
+                risk_pct=signal["risk_pct"],
+                regime=market_data["regime"],
+                strategy_version=signal["strategy_version"],
+                trade_id=position["trade_id"],
+                entry_dt_utc=position["entry_candle_time"],
+                position_size_usd=position["size_usd"],
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                f"{symbol}: failed to publish trading signal: {exc}"
+            )
+
+
+# ============================================================
+# REPORTS
+# ============================================================
+
+def handle_scheduled_tasks(
+    current_capital: float,
+):
+
+    global last_4h_report_key
+    global last_daily_report_date
+
+    now_utc = datetime.now(timezone.utc)
+
+    # --------------------------------------------------------
+    # 4-Hour report
+    # --------------------------------------------------------
+
+    report_key = now_utc.strftime(
+        "%Y-%m-%d-%H"
     )
 
-    df["bb_lower"] = (
-        df["bb_middle"]
-        - BB_STD_DEV * bb_std
+    if (
+        now_utc.hour % 4 == 0
+        and report_key != last_4h_report_key
+    ):
+
+        completed = engine.daily_completed_trades
+
+        daily_pnl = sum(
+            trade.get("pnl_usd", 0.0)
+            for trade in completed
+        )
+
+        wins = sum(
+            1
+            for trade in completed
+            if trade.get("pnl_usd", 0.0) >= 0
+        )
+
+        num_trades = len(completed)
+
+        win_rate = (
+            wins / num_trades * 100
+            if num_trades
+            else 0.0
+        )
+
+        report = format_4h_report(
+            current_time_utc=now_utc,
+            capital=current_capital,
+            daily_pnl=daily_pnl,
+            win_rate=win_rate,
+            num_trades=num_trades,
+            today_closed_trades_summary=list(
+                completed
+            ),
+            open_positions_summary=(
+                engine.get_current_open_positions_summary()
+            ),
+            market_overview={
+                symbol: data["market_data"]
+                for symbol, data
+                in market_cache.items()
+            },
+        )
+
+        send_to_personal_chat(report)
+
+        last_4h_report_key = report_key
+
+        logger.info(
+            "4-hour report sent."
+        )
+
+    # --------------------------------------------------------
+    # Daily journal
+    # --------------------------------------------------------
+
+    current_date = now_utc.strftime(
+        "%Y-%m-%d"
     )
 
-    # ========================================================
-    # ADX
-    # ========================================================
+    if (
+        now_utc.hour == 23
+        and current_date != last_daily_report_date
+    ):
 
-    up_move = df["high"].diff()
-    down_move = -df["low"].diff()
+        completed_trades, stats = (
+            engine.get_daily_journal_data()
+        )
 
-    plus_dm = pd.Series(
-        0.0,
-        index=df.index,
+        journal = format_daily_journal(
+            current_date_utc=now_utc,
+            starting_capital=config.INITIAL_CAPITAL,
+            ending_capital=current_capital,
+            daily_pnl=stats["pnl_usd"],
+            daily_pnl_pct=(
+                stats["pnl_usd"]
+                / config.INITIAL_CAPITAL
+                * 100
+                if config.INITIAL_CAPITAL
+                else 0.0
+            ),
+            num_trades=stats["trades"],
+            winning_trades=stats["wins"],
+            losing_trades=stats["losses"],
+            win_rate=stats["win_rate"],
+            total_pnl=0.0,
+            completed_trades_data=completed_trades,
+            open_positions_summary=(
+                engine.get_current_open_positions_summary()
+            ),
+            market_snapshot={
+                symbol: data["market_data"]
+                for symbol, data
+                in market_cache.items()
+            },
+        )
+
+        send_to_personal_chat(journal)
+
+        last_daily_report_date = current_date
+
+        # IMPORTANT:
+        # Do NOT reset open positions here.
+        engine.daily_completed_trades.clear()
+
+        logger.info(
+            "Daily journal sent and daily trade history cleared."
+        )
+
+    # --------------------------------------------------------
+    # Session alerts
+    # --------------------------------------------------------
+
+    try:
+        check_and_publish_session_alerts(
+            now_utc
+        )
+    except Exception as exc:
+        logger.exception(
+            f"Session alert error: {exc}"
+        )
+
+    # --------------------------------------------------------
+    # News alerts
+    # --------------------------------------------------------
+
+    # News should NOT be fetched every 5 minutes.
+    # The provider should internally rate-limit / cache it.
+    #
+    # If publish_news_alerts() is enabled, call it on a
+    # separate lower-frequency schedule.
+    #
+    # try:
+    #     publish_news_alerts()
+    # except Exception as exc:
+    #     logger.exception(f"News alert error: {exc}")
+
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
+def main_trading_loop():
+
+    global last_daily_refresh
+
+    logger.info(
+        "Starting SHERPA V5.3 main trading loop."
     )
 
-    minus_dm = pd.Series(
-        0.0,
-        index=df.index,
+    engine.initialize_trading_state()
+
+    current_capital = (
+        config.INITIAL_CAPITAL
     )
 
-    plus_dm[
-        (up_move > down_move) & (up_move > 0)
-    ] = up_move[
-        (up_move > down_move) & (up_move > 0)
-    ]
+    # --------------------------------------------------------
+    # Startup message
+    # --------------------------------------------------------
 
-    minus_dm[
-        (down_move > up_move) & (down_move > 0)
-    ] = down_move[
-        (down_move > up_move) & (down_move > 0)
-    ]
+    try:
 
-    atr_for_adx = true_range.ewm(
-        alpha=1 / ADX_PERIOD,
-        adjust=False,
-        min_periods=ADX_PERIOD,
-    ).mean()
+        send_to_personal_chat(
+            f"🚀 *SHERPA Bot V{config.BOT_VERSION} Started*\n\n"
+            f"Mode: Paper Trading\n"
+            f"Initial Capital: `${current_capital:,.2f}`\n"
+            f"Symbols: {', '.join(config.SYMBOLS)}\n\n"
+            f"📈 Strategy: {config.STRATEGY_VERSION}\n"
+            f"🛡 Break-even @ "
+            f"{config.BREAK_EVEN_TRIGGER_RATIO * 100:.0f}% TP distance\n"
+            f"🔒 Profit Lock @ "
+            f"{config.PROFIT_LOCK_TRIGGER_RATIO * 100:.0f}% TP distance\n"
+            f"❌ No continuous trailing stop"
+        )
 
-    plus_dm_smoothed = plus_dm.ewm(
-        alpha=1 / ADX_PERIOD,
-        adjust=False,
-        min_periods=ADX_PERIOD,
-    ).mean()
+    except Exception as exc:
 
-    minus_dm_smoothed = minus_dm.ewm(
-        alpha=1 / ADX_PERIOD,
-        adjust=False,
-        min_periods=ADX_PERIOD,
-    ).mean()
+        logger.exception(
+            f"Startup Telegram message failed: {exc}"
+        )
 
-    df["plus_di"] = (
-        100 * plus_dm_smoothed / atr_for_adx
+    # --------------------------------------------------------
+    # Main loop
+    # --------------------------------------------------------
+
+    while True:
+
+        cycle_start = time.monotonic()
+
+        try:
+
+            now_utc = datetime.now(
+                timezone.utc
+            )
+
+            refresh_daily = (
+                should_refresh_daily_data(
+                    now_utc
+                )
+            )
+
+            logger.info(
+                f"Starting market cycle | "
+                f"daily_refresh={refresh_daily}"
+            )
+
+            # ------------------------------------------------
+            # 1. Fetch/process each symbol ONCE
+            # ------------------------------------------------
+
+            for symbol in config.SYMBOLS:
+
+                fetch_and_process_symbol(
+                    symbol=symbol,
+                    refresh_daily=refresh_daily,
+                )
+
+                time.sleep(
+                    config.SYMBOL_DELAY_SECONDS
+                )
+
+            if refresh_daily:
+                last_daily_refresh = now_utc
+
+            # ------------------------------------------------
+            # 2. Manage existing positions
+            # ------------------------------------------------
+
+            current_market_data = {
+                symbol: data["market_data"]
+                for symbol, data
+                in market_cache.items()
+            }
+
+            if current_market_data:
+
+                closed_trades = (
+                    engine.manage_open_positions(
+                        current_market_data
+                    )
+                )
+
+                if closed_trades:
+
+                    closed_pnl = sum(
+                        trade.get("pnl_usd", 0.0)
+                        for trade
+                        in closed_trades.values()
+                    )
+
+                    current_capital += closed_pnl
+
+                    logger.info(
+                        f"Closed trades this cycle: "
+                        f"{len(closed_trades)} | "
+                        f"PnL: ${closed_pnl:+.2f} | "
+                        f"Capital: ${current_capital:.2f}"
+                    )
+
+            # ------------------------------------------------
+            # 3. Process new entries
+            # ------------------------------------------------
+
+            process_new_entries(
+                current_capital=current_capital
+            )
+
+            # ------------------------------------------------
+            # 4. Scheduled tasks
+            # ------------------------------------------------
+
+            handle_scheduled_tasks(
+                current_capital=current_capital
+            )
+
+            # ------------------------------------------------
+            # 5. Cycle statistics
+            # ------------------------------------------------
+
+            elapsed = (
+                time.monotonic()
+                - cycle_start
+            )
+
+            logger.info(
+                f"Cycle completed in "
+                f"{elapsed:.2f}s | "
+                f"Open positions: "
+                f"{len(engine.open_positions)}/"
+                f"{config.MAX_CONCURRENT_POSITIONS}"
+            )
+
+        except KeyboardInterrupt:
+
+            logger.info(
+                "SHERPA stopped manually."
+            )
+            break
+
+        except Exception as exc:
+
+            logger.exception(
+                f"Unexpected main-loop error: {exc}"
+            )
+
+        # ----------------------------------------------------
+        # Wait before next cycle
+        # ----------------------------------------------------
+
+        elapsed = (
+            time.monotonic()
+            - cycle_start
+        )
+
+        sleep_time = max(
+            1.0,
+            config.LOOP_DELAY_SECONDS
+            - elapsed,
+        )
+
+        logger.debug(
+            f"Sleeping {sleep_time:.1f}s..."
+        )
+
+        time.sleep(
+            sleep_time
+        )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+
+    logging.basicConfig(
+        level=config.LOGGING_LEVEL,
+        format=config.LOGGING_FORMAT,
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    df["minus_di"] = (
-        100 * minus_dm_smoothed / atr_for_adx
+    keep_alive_thread = threading.Thread(
+        target=run_keep_alive_server,
+        daemon=True,
     )
 
-    di_sum = (
-        df["plus_di"] +
-        df["minus_di"]
-    )
+    keep_alive_thread.start()
 
-    di_diff = (
-        df["plus_di"] -
-        df["minus_di"]
-    ).abs()
-
-    dx = (
-        100 * di_diff / di_sum.replace(0, pd.NA)
-    )
-
-    df["adx"] = dx.ewm(
-        alpha=1 / ADX_PERIOD,
-        adjust=False,
-        min_periods=ADX_PERIOD,
-    ).mean()
-
-    # ========================================================
-    # MFI
-    # ========================================================
-
-    typical_price = (
-        df["high"] +
-        df["low"] +
-        df["close"]
-    ) / 3
-
-    raw_money_flow = (
-        typical_price * df["volume"]
-    )
-
-    price_change = typical_price.diff()
-
-    positive_flow = raw_money_flow.where(
-        price_change > 0,
-        0.0,
-    )
-
-    negative_flow = raw_money_flow.where(
-        price_change < 0,
-        0.0,
-    )
-
-    positive_sum = positive_flow.rolling(
-        MFI_PERIOD,
-        min_periods=MFI_PERIOD,
-    ).sum()
-
-    negative_sum = negative_flow.rolling(
-        MFI_PERIOD,
-        min_periods=MFI_PERIOD,
-    ).sum()
-
-    money_ratio = (
-        positive_sum /
-        negative_sum.replace(0, pd.NA)
-    )
-
-    df["mfi"] = 100 - (
-        100 / (1 + money_ratio)
-    )
-
-    # No negative money flow => maximum MFI.
-    df.loc[
-        (negative_sum == 0) &
-        (positive_sum > 0),
-        "mfi",
-    ] = 100.0
-
-    # ========================================================
-    # Volume SMA
-    # ========================================================
-
-    df["vol_sma"] = df["volume"].rolling(
-        VOL_SMA_PERIOD,
-        min_periods=VOL_SMA_PERIOD,
-    ).mean()
-
-    # Keep the dataframe clean.
-    df.replace(
-        [float("inf"), float("-inf")],
-        pd.NA,
-        inplace=True,
-    )
-
-    return df
+    main_trading_loop()
