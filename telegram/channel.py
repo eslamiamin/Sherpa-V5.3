@@ -1,3 +1,4 @@
+```python
 """
 Telegram Channel Messaging Module.
 
@@ -12,8 +13,9 @@ Paper trading only.
 """
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time
 from typing import List, Dict, Any
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -33,7 +35,6 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 ADVISOR_BOT_TOKEN = config.TELEGRAM_BOT_TOKEN
-
 CHANNEL_CHAT_ID = config.TELEGRAM_CHANNEL_CHAT_ID
 
 
@@ -81,7 +82,11 @@ def send_telegram_message(
         response = requests.post(
             url,
             json=payload,
-            timeout=config.TELEGRAM_REQUEST_TIMEOUT,
+            timeout=getattr(
+                config,
+                "TELEGRAM_REQUEST_TIMEOUT",
+                10,
+            ),
         )
 
         response.raise_for_status()
@@ -162,11 +167,22 @@ def publish_trading_signal(
         profit_lock_triggered=False,
     )
 
-    direction_icon = (
-        "🟢"
-        if side == "LONG"
-        else "🔴"
-    )
+    side_upper = str(side).upper()
+
+    if side_upper in {
+        "LONG",
+        "BUY_LONG",
+        "BUY",
+    }:
+        direction_icon = "🟢"
+    elif side_upper in {
+        "SHORT",
+        "SELL_SHORT",
+        "SELL",
+    }:
+        direction_icon = "🔴"
+    else:
+        direction_icon = "⚪"
 
     message = (
         f"🚨 *NEW TRADING SIGNAL — "
@@ -212,6 +228,15 @@ def publish_status_update(
         "timestamp_utc",
         datetime.now(timezone.utc),
     )
+
+    if timestamp_utc.tzinfo is None:
+        timestamp_utc = timestamp_utc.replace(
+            tzinfo=timezone.utc
+        )
+    else:
+        timestamp_utc = timestamp_utc.astimezone(
+            timezone.utc
+        )
 
     timestamp = format_timestamp_message(
         timestamp_utc
@@ -355,7 +380,7 @@ def publish_status_update(
             f"`{details.get('exit_reason', 'N/A')}`\n"
             f"*PnL:* "
             f"`${pnl:+.2f}` "
-            f"(`{details.get('pnl_pct', 0.0):+.2f}%`)\n"
+            f"(`{float(details.get('pnl_pct', 0.0)):+.2f}%`)\n"
             f"*Regime:* "
             f"`{details.get('regime', 'N/A')}`\n\n"
             f"🕒 {timestamp}\n\n"
@@ -444,30 +469,69 @@ def publish_market_pulse(
 
 
 # ============================================================
-# SESSION TIMES
+# TRADING SESSIONS
 # ============================================================
 
-SESSION_TIMES = {
+SESSION_CONFIG = {
     "Tokyo": {
-        "start_utc": (1, 0),
-        "end_utc": (8, 0),
+        "timezone": ZoneInfo("Asia/Tokyo"),
+        "start": time(9, 0),
+        "end": time(15, 0),
     },
     "London": {
-        "start_utc": (8, 0),
-        "end_utc": (17, 0),
+        "timezone": ZoneInfo("Europe/London"),
+        "start": time(8, 0),
+        "end": time(16, 30),
     },
     "New York": {
-        "start_utc": (13, 0),
-        "end_utc": (22, 0),
+        "timezone": ZoneInfo("America/New_York"),
+        "start": time(9, 30),
+        "end": time(16, 0),
     },
 }
 
 
-# Keep track of the last alert per session/date.
 last_session_alert_sent: Dict[
     tuple,
     datetime,
 ] = {}
+
+
+def _get_session_window_utc(
+    session_name: str,
+    reference_utc: datetime,
+) -> tuple[datetime, datetime]:
+
+    session = SESSION_CONFIG[session_name]
+
+    tz = session["timezone"]
+
+    local_reference = reference_utc.astimezone(tz)
+
+    local_start = datetime.combine(
+        local_reference.date(),
+        session["start"],
+        tzinfo=tz,
+    )
+
+    local_end = datetime.combine(
+        local_reference.date(),
+        session["end"],
+        tzinfo=tz,
+    )
+
+    start_utc = local_start.astimezone(
+        timezone.utc
+    )
+
+    end_utc = local_end.astimezone(
+        timezone.utc
+    )
+
+    if end_utc <= start_utc:
+        end_utc += timedelta(days=1)
+
+    return start_utc, end_utc
 
 
 # ============================================================
@@ -509,38 +573,14 @@ def check_and_publish_session_alerts(
             timezone.utc
         )
 
-    for session_name, times in SESSION_TIMES.items():
+    for session_name in SESSION_CONFIG:
 
-        start_hour, start_minute = (
-            times["start_utc"]
-        )
-
-        end_hour, end_minute = (
-            times["end_utc"]
-        )
-
-        session_start_utc = datetime(
-            current_time_utc.year,
-            current_time_utc.month,
-            current_time_utc.day,
-            start_hour,
-            start_minute,
-            tzinfo=timezone.utc,
-        )
-
-        session_end_utc = datetime(
-            current_time_utc.year,
-            current_time_utc.month,
-            current_time_utc.day,
-            end_hour,
-            end_minute,
-            tzinfo=timezone.utc,
-        )
-
-        if session_end_utc <= session_start_utc:
-            session_end_utc += timedelta(
-                days=1
+        session_start_utc, session_end_utc = (
+            _get_session_window_utc(
+                session_name,
+                current_time_utc,
             )
+        )
 
         # Alert once during the first 5 minutes
         # of the session.
@@ -583,43 +623,15 @@ def is_current_session_active(
 
     for session_name in target_sessions:
 
-        if session_name not in SESSION_TIMES:
+        if session_name not in SESSION_CONFIG:
             continue
 
-        times = SESSION_TIMES[
-            session_name
-        ]
-
-        start_hour, start_minute = (
-            times["start_utc"]
-        )
-
-        end_hour, end_minute = (
-            times["end_utc"]
-        )
-
-        session_start_utc = datetime(
-            now_utc.year,
-            now_utc.month,
-            now_utc.day,
-            start_hour,
-            start_minute,
-            tzinfo=timezone.utc,
-        )
-
-        session_end_utc = datetime(
-            now_utc.year,
-            now_utc.month,
-            now_utc.day,
-            end_hour,
-            end_minute,
-            tzinfo=timezone.utc,
-        )
-
-        if session_end_utc <= session_start_utc:
-            session_end_utc += timedelta(
-                days=1
+        session_start_utc, session_end_utc = (
+            _get_session_window_utc(
+                session_name,
+                now_utc,
             )
+        )
 
         if (
             session_start_utc
@@ -643,10 +655,15 @@ def publish_news_alerts() -> None:
     provider connected, so no fake news should be published.
     """
 
-    if not config.NEWS_ENABLED:
+    if not getattr(
+        config,
+        "NEWS_ENABLED",
+        False,
+    ):
         return
 
     logger.warning(
         "NEWS_ENABLED=True but no real news provider "
         "is implemented."
     )
+```
