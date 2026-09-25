@@ -1,151 +1,407 @@
 """
-Risk Management and Position Sizing Module.
+SHERPA V5.3 - Risk Management and Position Sizing.
 
-This module contains functions for calculating the appropriate trade size
-based on the user's capital, defined risk percentage, and the distance to the
-initial stop loss. It ensures that no single trade exposes the portfolio to
-excessive risk and adheres to maximum position notional limits.
+Calculates paper-trading position notional based on:
+- Available capital
+- Risk percentage
+- Entry price
+- Initial stop-loss distance
+
+Also enforces the maximum position notional configured in config.py.
 """
 
 import logging
-import pandas as pd
 
 import config
 
+
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# POSITION SIZE
+# ============================================================
 
 def calculate_position_size(
     capital: float,
     risk_pct: float,
     entry_price: float,
-    stop_price: float
+    stop_price: float,
 ) -> float:
     """
-    Calculate the notional value (USD amount) for a trade based on risk parameters.
+    Calculate position notional in USD.
 
-    The calculation determines how much capital to allocate to a position
-    such that if the stop loss is hit, the loss does not exceed the specified
-    risk percentage of the total capital. It also enforces a maximum
-    notional value per position.
+    Formula:
+
+        risk_amount = capital × risk_pct
+
+        stop_distance_pct =
+            abs(entry_price - stop_price) / entry_price
+
+        position_notional =
+            risk_amount / stop_distance_pct
+
+    The result is capped by:
+
+        capital × MAX_POSITION_NOTIONAL_PCT
 
     Args:
-        capital (float): The total available trading capital.
-        risk_pct (float): The percentage of capital to risk on this trade (e.g., 0.01 for 1%).
-        entry_price (float): The price at which the trade is intended to enter.
-        stop_price (float): The price at which the initial stop loss is set.
+        capital:
+            Current paper-trading capital.
+
+        risk_pct:
+            Fraction of capital to risk.
+            Example: 0.01 = 1%.
+
+        entry_price:
+            Planned entry price.
+
+        stop_price:
+            Initial stop-loss price.
 
     Returns:
-        float: The calculated notional value (in USD) of the position. Returns 0.0 if
-               parameters are invalid or calculation results in zero/negative size.
+        Position notional in USD.
+        Returns 0.0 if inputs are invalid.
     """
-    if capital <= 0 or risk_pct <= 0 or entry_price <= 0 or stop_price <= 0:
-        logger.warning("Invalid input parameters for position size calculation: "
-                       f"capital={capital}, risk_pct={risk_pct}, entry={entry_price}, stop={stop_price}")
+
+    # --------------------------------------------------------
+    # Validate inputs
+    # --------------------------------------------------------
+
+    if capital <= 0:
+        logger.warning(
+            f"Invalid capital: {capital}"
+        )
         return 0.0
 
-    # Calculate the amount of capital to risk in USD
-    risk_amount = capital * risk_pct
+    if risk_pct <= 0:
+        logger.warning(
+            f"Invalid risk_pct: {risk_pct}"
+        )
+        return 0.0
 
-    # Calculate the price difference between entry and stop
-    stop_distance = abs(entry_price - stop_price)
+    if risk_pct > 1:
+        logger.warning(
+            f"risk_pct must be <= 1. "
+            f"Received: {risk_pct}"
+        )
+        return 0.0
 
-    # Ensure stop distance is positive to avoid division by zero or invalid calculations
+    if entry_price <= 0:
+        logger.warning(
+            f"Invalid entry price: {entry_price}"
+        )
+        return 0.0
+
+    if stop_price <= 0:
+        logger.warning(
+            f"Invalid stop price: {stop_price}"
+        )
+        return 0.0
+
+    # --------------------------------------------------------
+    # Stop distance
+    # --------------------------------------------------------
+
+    stop_distance = abs(
+        entry_price - stop_price
+    )
+
     if stop_distance <= 0:
-        logger.warning(f"Stop distance is zero or negative ({stop_distance}). Cannot calculate position size.")
+        logger.warning(
+            "Stop distance is zero. "
+            "Position size cannot be calculated."
+        )
         return 0.0
 
-    # Calculate the stop loss distance as a percentage of the entry price
-    stop_distance_pct = stop_distance / entry_price
+    stop_distance_pct = (
+        stop_distance / entry_price
+    )
 
-    # Calculate the required position size in notional value (USD)
-    # Position Size (USD) = Risk Amount (USD) / Stop Loss Distance (%)
-    position_notional = risk_amount / stop_distance_pct
-
-    # Apply the maximum notional position size constraint
-    # This prevents a single trade from taking up too much capital, even if risk % allows it.
-    max_notional_position = capital * config.MAX_POSITION_NOTIONAL_PCT
-    
-    calculated_position_size = min(position_notional, max_notional_position)
-
-    # Ensure the final calculated size is not negative (shouldn't happen with checks above, but good practice)
-    if calculated_position_size < 0:
-        logger.error(f"Calculated negative position size: {calculated_position_size}. Resetting to 0.")
+    if stop_distance_pct <= 0:
         return 0.0
-        
-    logger.debug(f"Calculated position size: "
-                 f"Capital=${capital:.2f}, Risk%={risk_pct:.4f}, Entry=${entry_price:.4f}, "
-                 f"Stop=${stop_price:.4f} -> "
-                 f"RiskAmount=${risk_amount:.2f}, StopDist%={stop_distance_pct:.4f}, "
-                 f"Notional=${position_notional:.2f}, MaxNotional=${max_notional_position:.2f} -> "
-                 f"FinalSize=${calculated_position_size:.2f}")
 
-    return calculated_position_size
+    # --------------------------------------------------------
+    # Risk amount
+    # --------------------------------------------------------
+
+    risk_amount = (
+        capital * risk_pct
+    )
+
+    # --------------------------------------------------------
+    # Raw position notional
+    # --------------------------------------------------------
+
+    position_notional = (
+        risk_amount
+        / stop_distance_pct
+    )
+
+    # --------------------------------------------------------
+    # Maximum position notional
+    # --------------------------------------------------------
+
+    max_notional_position = (
+        capital
+        * config.MAX_POSITION_NOTIONAL_PCT
+    )
+
+    calculated_position_size = min(
+        position_notional,
+        max_notional_position,
+    )
+
+    # --------------------------------------------------------
+    # Final validation
+    # --------------------------------------------------------
+
+    if calculated_position_size <= 0:
+        logger.warning(
+            f"Calculated position size is invalid: "
+            f"{calculated_position_size}"
+        )
+        return 0.0
+
+    logger.debug(
+        "Position size calculated | "
+        f"Capital=${capital:.2f} | "
+        f"Risk={risk_pct * 100:.2f}% | "
+        f"Entry=${entry_price:.8g} | "
+        f"SL=${stop_price:.8g} | "
+        f"StopDist={stop_distance_pct * 100:.4f}% | "
+        f"RiskAmount=${risk_amount:.2f} | "
+        f"RawNotional=${position_notional:.2f} | "
+        f"MaxNotional=${max_notional_position:.2f} | "
+        f"Final=${calculated_position_size:.2f}"
+    )
+
+    return float(
+        calculated_position_size
+    )
 
 
-# --- Example Usage ---
+# ============================================================
+# STANDALONE TEST
+# ============================================================
+
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG, format=config.LOGGING_FORMAT, datefmt="%Y-%m-%d %H:%M:%S")
+
+    logging.basicConfig(
+        level=config.LOGGING_LEVEL,
+        format=config.LOGGING_FORMAT,
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
     test_capital = 10000.0
     test_entry = 100.0
-    test_stop_atr_mult = 1.2
     test_atr = 1.0
 
-    print(f"--- Testing Position Sizing (Capital: ${test_capital:.2f}) ---")
-
-    # Test case 1: Normal risk regime
-    risk_pct_normal = config.NORMAL_REGIME_RISK_PCT
-    stop_price_normal = test_entry - (test_atr * test_stop_atr_mult)
-    position_size_normal = calculate_position_size(
-        capital=test_capital,
-        risk_pct=risk_pct_normal,
-        entry_price=test_entry,
-        stop_price=stop_price_normal
+    print(
+        "=========================================="
     )
-    print(f"Normal Risk ({risk_pct_normal*100:.1f}%):")
-    print(f"  Entry: ${test_entry:.2f}, Stop: ${stop_price_normal:.2f}")
-    print(f"  Calculated Position Size: ${position_size_normal:.2f}")
-
-    # Test case 2: Strong risk regime
-    risk_pct_strong = config.STRONG_REGIME_RISK_PCT
-    stop_price_strong = test_entry - (test_atr * test_stop_atr_mult) # Stop distance is the same
-    position_size_strong = calculate_position_size(
-        capital=test_capital,
-        risk_pct=risk_pct_strong,
-        entry_price=test_entry,
-        stop_price=stop_price_strong
+    print(
+        "SHERPA V5.3 - Risk Module Test"
     )
-    print(f"\nStrong Risk ({risk_pct_strong*100:.1f}%):")
-    print(f"  Entry: ${test_entry:.2f}, Stop: ${stop_price_strong:.2f}")
-    print(f"  Calculated Position Size: ${position_size_strong:.2f}")
-
-    # Test case 3: Scenario hitting Max Position Notional Limit
-    # Assume a very tight stop loss, which would normally lead to a huge position size
-    tight_stop_atr_mult = 0.1 # Very tight stop
-    tight_stop_price = test_entry - (test_atr * tight_stop_atr_mult)
-    max_allowed_notional = test_capital * config.MAX_POSITION_NOTIONAL_PCT
-    
-    # Calculate size with tight stop first
-    position_size_tight_stop = calculate_position_size(
-        capital=test_capital,
-        risk_pct=risk_pct_normal, # Using normal risk
-        entry_price=test_entry,
-        stop_price=tight_stop_price
+    print(
+        "=========================================="
     )
-    print(f"\nTight Stop Scenario (Risk: {risk_pct_normal*100:.1f}%, Stop Distance: {tight_stop_atr_mult*test_atr:.4f}):")
-    print(f"  Entry: ${test_entry:.2f}, Stop: ${tight_stop_price:.2f}")
-    print(f"  Calculated Position Size (before max limit): ${position_size_tight_stop:.2f}")
-    print(f"  Max Notional Limit: ${max_allowed_notional:.2f}")
-    
-    # The function should automatically cap it at max_allowed_notional
-    if position_size_tight_stop > max_allowed_notional:
-         print("  -> Position size correctly capped by MAX_POSITION_NOTIONAL_PCT.")
-    else:
-         print("  -> Position size was not capped (unexpected).")
 
-    # Test case 4: Invalid inputs
-    print("\n--- Testing Invalid Inputs ---")
-    invalid_size = calculate_position_size(0, 0.01, 100, 99)
-    print(f"Size with zero capital: ${invalid_size:.2f}")
-    invalid_size = calculate_position_size(1000, 0.01, 100, 100) # Zero stop distance
-    print(f"Size with zero stop distance: ${invalid_size:.2f}")
+    # --------------------------------------------------------
+    # Test 1: Normal regime
+    # --------------------------------------------------------
+
+    risk_pct_normal = (
+        config.NORMAL_REGIME_RISK_PCT
+    )
+
+    stop_price_normal = (
+        test_entry
+        - (
+            test_atr
+            * config.SL_ATR_MULTIPLIER
+        )
+    )
+
+    position_size_normal = (
+        calculate_position_size(
+            capital=test_capital,
+            risk_pct=risk_pct_normal,
+            entry_price=test_entry,
+            stop_price=stop_price_normal,
+        )
+    )
+
+    print(
+        "\nNormal Risk:"
+    )
+
+    print(
+        f"Risk: "
+        f"{risk_pct_normal * 100:.1f}%"
+    )
+
+    print(
+        f"Entry: "
+        f"${test_entry:.2f}"
+    )
+
+    print(
+        f"Stop: "
+        f"${stop_price_normal:.2f}"
+    )
+
+    print(
+        f"Position Size: "
+        f"${position_size_normal:.2f}"
+    )
+
+    # --------------------------------------------------------
+    # Test 2: Strong regime
+    # --------------------------------------------------------
+
+    risk_pct_strong = (
+        config.STRONG_REGIME_RISK_PCT
+    )
+
+    stop_price_strong = (
+        test_entry
+        - (
+            test_atr
+            * config.SL_ATR_MULTIPLIER
+        )
+    )
+
+    position_size_strong = (
+        calculate_position_size(
+            capital=test_capital,
+            risk_pct=risk_pct_strong,
+            entry_price=test_entry,
+            stop_price=stop_price_strong,
+        )
+    )
+
+    print(
+        "\nStrong Risk:"
+    )
+
+    print(
+        f"Risk: "
+        f"{risk_pct_strong * 100:.1f}%"
+    )
+
+    print(
+        f"Entry: "
+        f"${test_entry:.2f}"
+    )
+
+    print(
+        f"Stop: "
+        f"${stop_price_strong:.2f}"
+    )
+
+    print(
+        f"Position Size: "
+        f"${position_size_strong:.2f}"
+    )
+
+    # --------------------------------------------------------
+    # Test 3: Maximum notional cap
+    # --------------------------------------------------------
+
+    tight_stop = (
+        test_entry
+        - (
+            test_atr
+            * 0.1
+        )
+    )
+
+    max_allowed_notional = (
+        test_capital
+        * config.MAX_POSITION_NOTIONAL_PCT
+    )
+
+    position_size_tight = (
+        calculate_position_size(
+            capital=test_capital,
+            risk_pct=risk_pct_normal,
+            entry_price=test_entry,
+            stop_price=tight_stop,
+        )
+    )
+
+    print(
+        "\nMaximum Notional Test:"
+    )
+
+    print(
+        f"Calculated: "
+        f"${position_size_tight:.2f}"
+    )
+
+    print(
+        f"Maximum Allowed: "
+        f"${max_allowed_notional:.2f}"
+    )
+
+    assert (
+        position_size_tight
+        <= max_allowed_notional
+    )
+
+    print(
+        "PASS: Maximum notional cap works."
+    )
+
+    # --------------------------------------------------------
+    # Test 4: Invalid inputs
+    # --------------------------------------------------------
+
+    print(
+        "\nInvalid Input Tests:"
+    )
+
+    zero_capital = calculate_position_size(
+        capital=0,
+        risk_pct=0.01,
+        entry_price=100,
+        stop_price=99,
+    )
+
+    zero_distance = calculate_position_size(
+        capital=1000,
+        risk_pct=0.01,
+        entry_price=100,
+        stop_price=100,
+    )
+
+    invalid_risk = calculate_position_size(
+        capital=1000,
+        risk_pct=1.5,
+        entry_price=100,
+        stop_price=99,
+    )
+
+    print(
+        f"Zero capital: "
+        f"${zero_capital:.2f}"
+    )
+
+    print(
+        f"Zero stop distance: "
+        f"${zero_distance:.2f}"
+    )
+
+    print(
+        f"Invalid risk: "
+        f"${invalid_risk:.2f}"
+    )
+
+    assert zero_capital == 0.0
+    assert zero_distance == 0.0
+    assert invalid_risk == 0.0
+
+    print(
+        "PASS: Invalid input handling works."
+    )
