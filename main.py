@@ -33,7 +33,6 @@ from strategy.strategy import (
     detect_market_regime,
     generate_signals,
 )
-
 from telegram.personal import (
     send_to_personal_chat,
     format_4h_report,
@@ -57,9 +56,11 @@ logger = logging.getLogger(__name__)
 market_cache: Dict[str, Dict[str, Any]] = {}
 
 last_hourly_candle: Dict[str, Any] = {}
+
 last_daily_refresh: Optional[datetime] = None
 
 last_4h_report_key: Optional[str] = None
+
 last_daily_report_date: Optional[str] = None
 
 # Prevent processing the same 1H candle repeatedly.
@@ -73,9 +74,16 @@ last_entry_signal_candle: Dict[str, Any] = {}
 class DummyServer(BaseHTTPRequestHandler):
 
     def do_GET(self):
+
         self.send_response(200)
-        self.send_header("Content-type", "text/plain")
+
+        self.send_header(
+            "Content-type",
+            "text/plain",
+        )
+
         self.end_headers()
+
         self.wfile.write(
             b"SHERPA V5.3 Bot is alive and running!"
         )
@@ -85,13 +93,21 @@ class DummyServer(BaseHTTPRequestHandler):
 
 
 def run_keep_alive_server():
+
     port = int(
-        os.getenv("PORT", "8080")
+        os.getenv(
+            "PORT",
+            "8080",
+        )
     )
 
     try:
+
         server = HTTPServer(
-            ("0.0.0.0", port),
+            (
+                "0.0.0.0",
+                port,
+            ),
             DummyServer,
         )
 
@@ -102,6 +118,7 @@ def run_keep_alive_server():
         server.serve_forever()
 
     except Exception as exc:
+
         logger.exception(
             f"Keep-alive server failed: {exc}"
         )
@@ -165,9 +182,11 @@ def fetch_and_process_symbol(
         )
 
         if df_1h.empty:
+
             logger.warning(
                 f"{symbol}: empty hourly data"
             )
+
             return None
 
         # ----------------------------------------------------
@@ -181,6 +200,7 @@ def fetch_and_process_symbol(
             and cached is not None
             and cached.get("df_1d") is not None
         ):
+
             df_1d = cached["df_1d"]
 
         else:
@@ -192,9 +212,11 @@ def fetch_and_process_symbol(
             )
 
             if df_1d.empty:
+
                 logger.warning(
                     f"{symbol}: empty daily data"
                 )
+
                 return None
 
         # ----------------------------------------------------
@@ -238,9 +260,11 @@ def fetch_and_process_symbol(
             df_1h_ind.empty
             or df_1d_ind.empty
         ):
+
             logger.warning(
                 f"{symbol}: indicator calculation failed"
             )
+
             return None
 
         # ----------------------------------------------------
@@ -248,11 +272,14 @@ def fetch_and_process_symbol(
         # ----------------------------------------------------
 
         latest_hourly = df_1h_ind.iloc[-1]
+
         latest_daily = df_1d_ind.iloc[-1]
 
         candle_time = latest_hourly["timestamp"]
 
-        now_utc = datetime.now(timezone.utc)
+        now_utc = datetime.now(
+            timezone.utc
+        )
 
         price = float(
             latest_hourly["close"]
@@ -273,12 +300,21 @@ def fetch_and_process_symbol(
 
         # ----------------------------------------------------
         # 7. Market snapshot
+        #
+        # IMPORTANT:
+        # "open" was added so the trading engine can correctly
+        # handle gaps when a SL is crossed between candles.
         # ----------------------------------------------------
 
         market_data = {
+
             "symbol": symbol,
 
             "price": price,
+
+            "open": float(
+                latest_hourly["open"]
+            ),
 
             "high": float(
                 latest_hourly["high"]
@@ -298,17 +334,23 @@ def fetch_and_process_symbol(
 
             "change_4h": percentage_change(
                 price,
-                float(df_1h_ind.iloc[-5]["close"]),
+                float(
+                    df_1h_ind.iloc[-5]["close"]
+                ),
             ),
 
             "change_1d": percentage_change(
                 price,
-                float(df_1h_ind.iloc[-25]["close"]),
+                float(
+                    df_1h_ind.iloc[-25]["close"]
+                ),
             ),
 
             "change_1w": percentage_change(
                 price,
-                float(df_1h_ind.iloc[-169]["close"]),
+                float(
+                    df_1h_ind.iloc[-169]["close"]
+                ),
             ),
 
             "candle_time": candle_time,
@@ -350,13 +392,22 @@ def fetch_and_process_symbol(
         # ----------------------------------------------------
 
         market_cache[symbol] = {
+
             "df_1h": df_1h,
+
             "df_1d": df_1d,
+
             "df_1h_indicators": df_1h_ind,
+
             "df_1d_indicators": df_1d_ind,
+
             "market_data": market_data,
+
             "signal": signal,
-            "is_new_hourly_candle": is_new_hourly_candle,
+
+            "is_new_hourly_candle":
+                is_new_hourly_candle,
+
             "fetched_at": now_utc,
         }
 
@@ -378,6 +429,7 @@ def fetch_and_process_symbol(
 def process_new_entries(
     current_capital: float,
 ):
+
     """
     Process signals using already-fetched cached data.
 
@@ -386,10 +438,16 @@ def process_new_entries(
 
     for symbol in config.SYMBOLS:
 
-        if len(engine.open_positions) >= config.MAX_CONCURRENT_POSITIONS:
+        if (
+            len(engine.open_positions)
+            >= config.MAX_CONCURRENT_POSITIONS
+        ):
+
             break
 
-        cached = market_cache.get(symbol)
+        cached = market_cache.get(
+            symbol
+        )
 
         if not cached:
             continue
@@ -398,35 +456,55 @@ def process_new_entries(
         if symbol in engine.open_positions:
             continue
 
-        # Only evaluate an entry once per new closed 1H candle.
-        if not cached.get("is_new_hourly_candle"):
-            continue
-
-        market_data = cached["market_data"]
-        signal = cached["signal"]
-
-        candle_time = market_data["candle_time"]
-
-        if (
-            last_entry_signal_candle.get(symbol)
-            == candle_time
+        # Only evaluate an entry once per new
+        # closed 1H candle.
+        if not cached.get(
+            "is_new_hourly_candle"
         ):
             continue
 
-        # Mark as processed regardless of HOLD.
-        last_entry_signal_candle[symbol] = candle_time
+        market_data = cached["market_data"]
 
-        if signal.get("action") == "HOLD":
+        signal = cached["signal"]
+
+        candle_time = market_data[
+            "candle_time"
+        ]
+
+        if (
+            last_entry_signal_candle.get(
+                symbol
+            )
+            == candle_time
+        ):
+
             continue
 
-        opened, position = engine.process_symbol_state(
-            symbol=symbol,
-            signal=signal,
-            market_data=market_data,
-            current_capital=current_capital,
+        # Mark as processed regardless of HOLD.
+        last_entry_signal_candle[
+            symbol
+        ] = candle_time
+
+        if signal.get(
+            "action"
+        ) == "HOLD":
+
+            continue
+
+        opened, position = (
+            engine.process_symbol_state(
+                symbol=symbol,
+                signal=signal,
+                market_data=market_data,
+                current_capital=current_capital,
+            )
         )
 
-        if not opened or position is None:
+        if (
+            not opened
+            or position is None
+        ):
+
             continue
 
         # ----------------------------------------------------
@@ -436,17 +514,46 @@ def process_new_entries(
         try:
 
             publish_trading_signal(
+
                 symbol=symbol,
+
                 side=signal["action"],
-                entry_price=signal["entry_price"],
-                stop_price=signal["stop_price"],
-                tp_price=signal["take_profit_price"],
-                risk_pct=signal["risk_pct"],
-                regime=market_data["regime"],
-                strategy_version=signal["strategy_version"],
-                trade_id=position["trade_id"],
-                entry_dt_utc=position["entry_candle_time"],
-                position_size_usd=position["size_usd"],
+
+                entry_price=signal[
+                    "entry_price"
+                ],
+
+                stop_price=signal[
+                    "stop_price"
+                ],
+
+                tp_price=signal[
+                    "take_profit_price"
+                ],
+
+                risk_pct=signal[
+                    "risk_pct"
+                ],
+
+                regime=market_data[
+                    "regime"
+                ],
+
+                strategy_version=signal[
+                    "strategy_version"
+                ],
+
+                trade_id=position[
+                    "trade_id"
+                ],
+
+                entry_dt_utc=position[
+                    "entry_candle_time"
+                ],
+
+                position_size_usd=position[
+                    "size_usd"
+                ],
             )
 
         except Exception as exc:
@@ -465,9 +572,12 @@ def handle_scheduled_tasks(
 ):
 
     global last_4h_report_key
+
     global last_daily_report_date
 
-    now_utc = datetime.now(timezone.utc)
+    now_utc = datetime.now(
+        timezone.utc
+    )
 
     # --------------------------------------------------------
     # 4-Hour report
@@ -479,23 +589,34 @@ def handle_scheduled_tasks(
 
     if (
         now_utc.hour % 4 == 0
-        and report_key != last_4h_report_key
+        and report_key
+        != last_4h_report_key
     ):
 
-        completed = engine.daily_completed_trades
+        completed = (
+            engine.daily_completed_trades
+        )
 
         daily_pnl = sum(
-            trade.get("pnl_usd", 0.0)
+            trade.get(
+                "pnl_usd",
+                0.0,
+            )
             for trade in completed
         )
 
         wins = sum(
             1
             for trade in completed
-            if trade.get("pnl_usd", 0.0) >= 0
+            if trade.get(
+                "pnl_usd",
+                0.0,
+            ) >= 0
         )
 
-        num_trades = len(completed)
+        num_trades = len(
+            completed
+        )
 
         win_rate = (
             wins / num_trades * 100
@@ -504,17 +625,25 @@ def handle_scheduled_tasks(
         )
 
         report = format_4h_report(
+
             current_time_utc=now_utc,
+
             capital=current_capital,
+
             daily_pnl=daily_pnl,
+
             win_rate=win_rate,
+
             num_trades=num_trades,
+
             today_closed_trades_summary=list(
                 completed
             ),
+
             open_positions_summary=(
                 engine.get_current_open_positions_summary()
             ),
+
             market_overview={
                 symbol: data["market_data"]
                 for symbol, data
@@ -522,9 +651,21 @@ def handle_scheduled_tasks(
             },
         )
 
-        send_to_personal_chat(report)
+        try:
 
-        last_4h_report_key = report_key
+            send_to_personal_chat(
+                report
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                f"4-hour report Telegram error: {exc}"
+            )
+
+        last_4h_report_key = (
+            report_key
+        )
 
         logger.info(
             "4-hour report sent."
@@ -540,7 +681,8 @@ def handle_scheduled_tasks(
 
     if (
         now_utc.hour == 23
-        and current_date != last_daily_report_date
+        and current_date
+        != last_daily_report_date
     ):
 
         completed_trades, stats = (
@@ -548,10 +690,19 @@ def handle_scheduled_tasks(
         )
 
         journal = format_daily_journal(
+
             current_date_utc=now_utc,
-            starting_capital=config.INITIAL_CAPITAL,
+
+            starting_capital=(
+                config.INITIAL_CAPITAL
+            ),
+
             ending_capital=current_capital,
-            daily_pnl=stats["pnl_usd"],
+
+            daily_pnl=stats[
+                "pnl_usd"
+            ],
+
             daily_pnl_pct=(
                 stats["pnl_usd"]
                 / config.INITIAL_CAPITAL
@@ -559,15 +710,33 @@ def handle_scheduled_tasks(
                 if config.INITIAL_CAPITAL
                 else 0.0
             ),
-            num_trades=stats["trades"],
-            winning_trades=stats["wins"],
-            losing_trades=stats["losses"],
-            win_rate=stats["win_rate"],
+
+            num_trades=stats[
+                "trades"
+            ],
+
+            winning_trades=stats[
+                "wins"
+            ],
+
+            losing_trades=stats[
+                "losses"
+            ],
+
+            win_rate=stats[
+                "win_rate"
+            ],
+
             total_pnl=0.0,
-            completed_trades_data=completed_trades,
+
+            completed_trades_data=(
+                completed_trades
+            ),
+
             open_positions_summary=(
                 engine.get_current_open_positions_summary()
             ),
+
             market_snapshot={
                 symbol: data["market_data"]
                 for symbol, data
@@ -575,9 +744,21 @@ def handle_scheduled_tasks(
             },
         )
 
-        send_to_personal_chat(journal)
+        try:
 
-        last_daily_report_date = current_date
+            send_to_personal_chat(
+                journal
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                f"Daily journal Telegram error: {exc}"
+            )
+
+        last_daily_report_date = (
+            current_date
+        )
 
         # IMPORTANT:
         # Do NOT reset open positions here.
@@ -592,10 +773,13 @@ def handle_scheduled_tasks(
     # --------------------------------------------------------
 
     try:
+
         check_and_publish_session_alerts(
             now_utc
         )
+
     except Exception as exc:
+
         logger.exception(
             f"Session alert error: {exc}"
         )
@@ -613,7 +797,9 @@ def handle_scheduled_tasks(
     # try:
     #     publish_news_alerts()
     # except Exception as exc:
-    #     logger.exception(f"News alert error: {exc}")
+    #     logger.exception(
+    #         f"News alert error: {exc}"
+    #     )
 
 
 # ============================================================
@@ -641,15 +827,28 @@ def main_trading_loop():
     try:
 
         send_to_personal_chat(
+
             f"🚀 *SHERPA Bot V{config.BOT_VERSION} Started*\n\n"
+
             f"Mode: Paper Trading\n"
-            f"Initial Capital: `${current_capital:,.2f}`\n"
-            f"Symbols: {', '.join(config.SYMBOLS)}\n\n"
-            f"📈 Strategy: {config.STRATEGY_VERSION}\n"
+
+            f"Initial Capital: "
+            f"`${current_capital:,.2f}`\n"
+
+            f"Symbols: "
+            f"{', '.join(config.SYMBOLS)}\n\n"
+
+            f"📈 Strategy: "
+            f"{config.STRATEGY_VERSION}\n"
+
             f"🛡 Break-even @ "
-            f"{config.BREAK_EVEN_TRIGGER_RATIO * 100:.0f}% TP distance\n"
+            f"{config.BREAK_EVEN_TRIGGER_RATIO * 100:.0f}% "
+            f"TP distance\n"
+
             f"🔒 Profit Lock @ "
-            f"{config.PROFIT_LOCK_TRIGGER_RATIO * 100:.0f}% TP distance\n"
+            f"{config.PROFIT_LOCK_TRIGGER_RATIO * 100:.0f}% "
+            f"TP distance\n"
+
             f"❌ No continuous trailing stop"
         )
 
@@ -686,21 +885,92 @@ def main_trading_loop():
 
             # ------------------------------------------------
             # 1. Fetch/process each symbol ONCE
+            #
+            # IMPORTANT FIX:
+            # Daily refresh is considered successful only
+            # when every symbol has been processed successfully.
+            #
+            # Previously:
+            #
+            #     fetch symbol A -> OK
+            #     fetch symbol B -> FAIL
+            #     fetch symbol C -> FAIL
+            #
+            # still resulted in:
+            #
+            #     last_daily_refresh = now_utc
+            #
+            # which prevented retrying the failed daily data
+            # for another 4 hours.
             # ------------------------------------------------
+
+            daily_refresh_success = True
+
+            successful_symbols = 0
+
+            failed_symbols = 0
 
             for symbol in config.SYMBOLS:
 
-                fetch_and_process_symbol(
-                    symbol=symbol,
-                    refresh_daily=refresh_daily,
+                result = (
+                    fetch_and_process_symbol(
+                        symbol=symbol,
+                        refresh_daily=refresh_daily,
+                    )
                 )
+
+                if result is None:
+
+                    failed_symbols += 1
+
+                    if refresh_daily:
+
+                        daily_refresh_success = False
+
+                    logger.warning(
+                        f"{symbol}: market data processing failed "
+                        f"in current cycle."
+                    )
+
+                else:
+
+                    successful_symbols += 1
 
                 time.sleep(
                     config.SYMBOL_DELAY_SECONDS
                 )
 
+            # ------------------------------------------------
+            # IMPORTANT:
+            #
+            # Only update last_daily_refresh when the daily
+            # refresh was completely successful.
+            #
+            # If any symbol failed, keep the old timestamp.
+            # This forces the next cycle to retry the refresh.
+            # ------------------------------------------------
+
             if refresh_daily:
-                last_daily_refresh = now_utc
+
+                if daily_refresh_success:
+
+                    last_daily_refresh = now_utc
+
+                    logger.info(
+                        "Daily market data refresh "
+                        "completed successfully | "
+                        f"symbols={successful_symbols}"
+                    )
+
+                else:
+
+                    logger.warning(
+                        "Daily market data refresh was incomplete | "
+                        f"successful={successful_symbols} | "
+                        f"failed={failed_symbols} | "
+                        "last_daily_refresh was NOT updated. "
+                        "The next cycle will retry."
+                    )
 
             # ------------------------------------------------
             # 2. Manage existing positions
@@ -723,12 +993,17 @@ def main_trading_loop():
                 if closed_trades:
 
                     closed_pnl = sum(
-                        trade.get("pnl_usd", 0.0)
+                        trade.get(
+                            "pnl_usd",
+                            0.0,
+                        )
                         for trade
                         in closed_trades.values()
                     )
 
-                    current_capital += closed_pnl
+                    current_capital += (
+                        closed_pnl
+                    )
 
                     logger.info(
                         f"Closed trades this cycle: "
@@ -775,6 +1050,7 @@ def main_trading_loop():
             logger.info(
                 "SHERPA stopped manually."
             )
+
             break
 
         except Exception as exc:
@@ -814,13 +1090,18 @@ def main_trading_loop():
 if __name__ == "__main__":
 
     logging.basicConfig(
+
         level=config.LOGGING_LEVEL,
+
         format=config.LOGGING_FORMAT,
+
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
     keep_alive_thread = threading.Thread(
+
         target=run_keep_alive_server,
+
         daemon=True,
     )
 
