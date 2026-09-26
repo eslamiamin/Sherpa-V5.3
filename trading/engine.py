@@ -1,17 +1,13 @@
 """
 SHERPA V5.3 - Trading Engine
+Paper-trading engine with conservative intrabar handling.
 
-Responsible for:
-- Opening paper-trading positions
-- Managing open positions
-- Break-even logic
-- Profit-lock logic
-- TP / SL detection
-- PnL calculation
-- Trade journaling
-- Preventing duplicate candle processing
-
-Paper trading only.
+Main fixes in this version:
+- Existing SL/TP are checked before BE/Profit-Lock changes.
+- A newly triggered BE/Profit-Lock becomes effective from the next candle.
+- If TP and SL are both touched in one candle, SL wins (conservative).
+- Total open notional is capped by current capital.
+- Telegram failures do not break trade execution.
 """
 
 import logging
@@ -22,7 +18,6 @@ import pandas as pd
 
 import config
 from trading.risk import calculate_position_size
-
 from telegram.personal import (
     send_to_personal_chat,
     format_entry_message,
@@ -32,39 +27,15 @@ from telegram.personal import (
     format_trade_line,
 )
 
-
 logger = logging.getLogger(__name__)
-
 
 # ============================================================
 # GLOBAL STATE
 # ============================================================
 
-# {
-#     "BTCUSDT": {
-#         "type": "LONG" | "SHORT",
-#         "entry": float,
-#         "tp": float,
-#         "sl": float,
-#         "initial_sl": float,
-#         "size_usd": float,
-#         "risk_pct": float,
-#         "regime": str,
-#         "strategy_version": str,
-#         "entry_candle_time": pd.Timestamp,
-#         "trade_id": str,
-#         "break_even_triggered": bool,
-#         "profit_lock_triggered": bool,
-#     }
-# }
-
 open_positions: Dict[str, Dict[str, Any]] = {}
 
-# Last candle that was actually processed for position management.
-#
-# This is important because main.py runs every 5 minutes while the
-# strategy candle is 1H. Without this guard, the same closed candle
-# could trigger TP/SL repeatedly.
+# Last 1H candle actually processed for position management.
 last_processed_candle_time: Dict[str, pd.Timestamp] = {}
 
 # Closed trades since the beginning of the current journal period.
@@ -76,18 +47,7 @@ daily_completed_trades: List[Dict[str, Any]] = []
 # ============================================================
 
 def _normalize_side(action: str) -> Optional[str]:
-    """
-    Convert strategy action into the internal engine representation.
-
-    Strategy may return:
-        BUY_LONG
-        SELL_SHORT
-
-    Engine stores:
-        LONG
-        SHORT
-    """
-
+    """Convert strategy action to LONG / SHORT."""
     if not action:
         return None
 
@@ -114,9 +74,8 @@ def _calculate_pnl(
     """
     Calculate absolute and percentage PnL.
 
-    Position size is treated as USD notional.
+    Position size is USD notional.
     """
-
     entry = float(position["entry"])
     size_usd = float(position["size_usd"])
     side = position["type"]
@@ -125,14 +84,9 @@ def _calculate_pnl(
         return 0.0, 0.0
 
     if side == "LONG":
-        price_return = (
-            exit_price - entry
-        ) / entry
-
+        price_return = (exit_price - entry) / entry
     else:
-        price_return = (
-            entry - exit_price
-        ) / entry
+        price_return = (entry - exit_price) / entry
 
     pnl_usd = size_usd * price_return
     pnl_pct = price_return * 100.0
@@ -145,13 +99,7 @@ def get_position_pnl(
     current_price: float,
     current_time_utc: Optional[datetime] = None,
 ) -> Tuple[float, float, float]:
-    """
-    Return:
-        pnl_usd
-        pnl_pct
-        current_stop_loss
-    """
-
+    """Return pnl_usd, pnl_pct and current stop loss."""
     pnl_usd, pnl_pct = _calculate_pnl(
         position,
         float(current_price),
@@ -162,6 +110,37 @@ def get_position_pnl(
         pnl_pct,
         float(position["sl"]),
     )
+
+
+def _get_total_open_exposure() -> float:
+    """Return total USD notional currently allocated to open positions."""
+    total = 0.0
+
+    for position in open_positions.values():
+        try:
+            total += float(position.get("size_usd", 0.0))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid size_usd found while calculating exposure: %s",
+                position,
+            )
+
+    return total
+
+
+def _send_telegram_safely(message: Any, context: str) -> None:
+    """
+    Telegram is a notification layer.
+    A Telegram/API failure must never stop trade management.
+    """
+    try:
+        send_to_personal_chat(message)
+    except Exception as exc:
+        logger.exception(
+            "%s Telegram error: %s",
+            context,
+            exc,
+        )
 
 
 # ============================================================
@@ -175,9 +154,7 @@ def record_trade_completion(
     exit_reason: str,
     exit_candle_time: pd.Timestamp,
 ) -> Dict[str, Any]:
-    """
-    Build and store a completed trade record.
-    """
+    """Build and store a completed trade record."""
 
     pnl_usd, pnl_pct = _calculate_pnl(
         position,
@@ -203,12 +180,8 @@ def record_trade_completion(
         exit_reason=exit_reason,
         pnl_usd=pnl_usd,
         pnl_pct=pnl_pct,
-        break_even_triggered=position[
-            "break_even_triggered"
-        ],
-        profit_lock_triggered=position[
-            "profit_lock_triggered"
-        ],
+        break_even_triggered=position["break_even_triggered"],
+        profit_lock_triggered=position["profit_lock_triggered"],
     )
 
     completed_trade = {
@@ -226,32 +199,23 @@ def record_trade_completion(
         "pnl_pct": pnl_pct,
         "exit_reason": exit_reason,
         "regime": position["regime"],
-        "strategy_version": position[
-            "strategy_version"
-        ],
-        "entry_candle_time": position[
-            "entry_candle_time"
-        ],
+        "strategy_version": position["strategy_version"],
+        "entry_candle_time": position["entry_candle_time"],
         "exit_candle_time": exit_candle_time,
-        "break_even_triggered": position[
-            "break_even_triggered"
-        ],
-        "profit_lock_triggered": position[
-            "profit_lock_triggered"
-        ],
+        "break_even_triggered": position["break_even_triggered"],
+        "profit_lock_triggered": position["profit_lock_triggered"],
         "trade_line": trade_line,
     }
 
-    daily_completed_trades.append(
-        completed_trade
-    )
+    daily_completed_trades.append(completed_trade)
 
     logger.info(
-        f"Trade closed | "
-        f"{position['trade_id']} | "
-        f"{symbol} {position['type']} | "
-        f"Reason={exit_reason} | "
-        f"PnL=${pnl_usd:+.2f}"
+        "Trade closed | %s | %s %s | Reason=%s | PnL=$%+.2f",
+        position["trade_id"],
+        symbol,
+        position["type"],
+        exit_reason,
+        pnl_usd,
     )
 
     return completed_trade
@@ -267,46 +231,48 @@ def manage_open_positions(
     """
     Manage all currently open positions.
 
-    Important:
-    The bot runs every few minutes but the strategy is based on
-    closed 1H candles. Therefore each candle is processed only once.
+    Intrabar policy
+    ---------------
+    The engine receives OHLC for a closed 1H candle, but OHLC does not
+    tell us the order in which HIGH and LOW happened.
+
+    Therefore:
+
+    1. Existing SL/TP are evaluated first.
+    2. If both existing SL and TP are touched, SL wins.
+    3. Only if the position survives the candle do we trigger
+       Break-Even / Profit-Lock.
+    4. A newly changed SL is therefore NOT used to close the same candle.
+
+    This prevents look-ahead caused by:
+        HIGH -> move SL -> LOW -> close at the new SL
+    when the actual intrabar order could have been:
+        LOW -> HIGH
     """
 
-    closed_trades_info: Dict[
-        str, Dict[str, Any]
-    ] = {}
+    closed_trades_info: Dict[str, Dict[str, Any]] = {}
 
-    for symbol, position in list(
-        open_positions.items()
-    ):
+    for symbol, position in list(open_positions.items()):
 
-        market_info = current_market_data.get(
-            symbol
-        )
+        market_info = current_market_data.get(symbol)
 
         if not market_info:
             logger.warning(
-                f"{symbol}: no market data for open position."
+                "%s: no market data for open position.",
+                symbol,
             )
             continue
 
-        candle_time = market_info.get(
-            "candle_time"
-        )
+        candle_time = market_info.get("candle_time")
 
         if candle_time is None:
             logger.warning(
-                f"{symbol}: candle_time missing."
+                "%s: candle_time missing.",
+                symbol,
             )
             continue
 
-        # ----------------------------------------------------
-        # Do not process the same candle twice.
-        # ----------------------------------------------------
-
-        previous_processed = (
-            last_processed_candle_time.get(symbol)
-        )
+        previous_processed = last_processed_candle_time.get(symbol)
 
         if (
             previous_processed is not None
@@ -314,333 +280,231 @@ def manage_open_positions(
         ):
             continue
 
-        current_price = float(
-            market_info["price"]
-        )
-
-        high_price = float(
-            market_info["high"]
-        )
-
-        low_price = float(
-            market_info["low"]
-        )
+        try:
+            current_price = float(market_info["price"])
+            high_price = float(market_info["high"])
+            low_price = float(market_info["low"])
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.exception(
+                "%s: invalid market data: %s",
+                symbol,
+                exc,
+            )
+            last_processed_candle_time[symbol] = candle_time
+            continue
 
         current_time_utc = (
             market_info.get("timestamp_utc")
             or datetime.now(timezone.utc)
         )
 
-        entry = float(
-            position["entry"]
-        )
-
-        tp = float(
-            position["tp"]
-        )
-
+        entry = float(position["entry"])
+        tp = float(position["tp"])
         side = position["type"]
+        current_sl = float(position["sl"])
 
-        current_sl = float(
-            position["sl"]
-        )
-
-        tp_distance = abs(
-            tp - entry
-        )
+        tp_distance = abs(tp - entry)
 
         if tp_distance <= 0:
             logger.error(
-                f"{symbol}: invalid TP distance."
+                "%s: invalid TP distance.",
+                symbol,
             )
-
-            last_processed_candle_time[
-                symbol
-            ] = candle_time
-
+            last_processed_candle_time[symbol] = candle_time
             continue
 
-        # ----------------------------------------------------
-        # Mark candle as processed.
-        #
-        # This prevents the same candle from being evaluated
-        # again if main.py runs again before a new 1H candle.
-        # ----------------------------------------------------
+        # Mark the candle as processed before any exit/trigger action.
+        last_processed_candle_time[symbol] = candle_time
 
-        last_processed_candle_time[
-            symbol
-        ] = candle_time
-
-        # ----------------------------------------------------
-        # Favorable excursion.
-        #
-        # Use HIGH for LONG and LOW for SHORT rather than
-        # current close. This means BE/Profit Lock can trigger
-        # when the candle actually reached the threshold.
-        # ----------------------------------------------------
+        # --------------------------------------------------------
+        # STEP 1: EXISTING SL / TP
+        # --------------------------------------------------------
 
         if side == "LONG":
-
-            favorable_price = high_price
-
+            hit_tp = high_price >= tp
+            hit_sl = low_price <= current_sl
         else:
-
-            favorable_price = low_price
-
-        if side == "LONG":
-
-            favorable_move = max(
-                0.0,
-                favorable_price - entry,
-            )
-
-        else:
-
-            favorable_move = max(
-                0.0,
-                entry - favorable_price,
-            )
-
-        progress_ratio = (
-            favorable_move / tp_distance
-        )
-
-        # ----------------------------------------------------
-        # 1. BREAK-EVEN
-        # ----------------------------------------------------
-
-        if (
-            not position["break_even_triggered"]
-            and progress_ratio
-            >= config.BREAK_EVEN_TRIGGER_RATIO
-        ):
-
-            old_sl = position["sl"]
-
-            position["sl"] = entry
-
-            position[
-                "break_even_triggered"
-            ] = True
-
-            send_to_personal_chat(
-                format_break_even_message(
-                    trade_id=position[
-                        "trade_id"
-                    ],
-                    symbol=symbol,
-                    entry_price=entry,
-                    old_sl=old_sl,
-                    new_sl=position["sl"],
-                    current_price=current_price,
-                    timestamp_utc=current_time_utc,
-                )
-            )
-
-            logger.info(
-                f"BREAK-EVEN | "
-                f"{symbol} | "
-                f"{position['trade_id']} | "
-                f"SL={position['sl']:.8g}"
-            )
-
-            current_sl = position["sl"]
-
-        # ----------------------------------------------------
-        # 2. PROFIT LOCK
-        # ----------------------------------------------------
-
-        if (
-            not position["profit_lock_triggered"]
-            and progress_ratio
-            >= config.PROFIT_LOCK_TRIGGER_RATIO
-        ):
-
-            if side == "LONG":
-
-                locked_sl_price = (
-                    entry
-                    + tp_distance
-                    * config.PROFIT_LOCK_SL_RATIO
-                )
-
-            else:
-
-                locked_sl_price = (
-                    entry
-                    - tp_distance
-                    * config.PROFIT_LOCK_SL_RATIO
-                )
-
-            old_sl = position["sl"]
-
-            # Never move the stop backwards.
-            if side == "LONG":
-
-                new_sl = max(
-                    old_sl,
-                    locked_sl_price,
-                )
-
-            else:
-
-                new_sl = min(
-                    old_sl,
-                    locked_sl_price,
-                )
-
-            position["sl"] = new_sl
-
-            position[
-                "profit_lock_triggered"
-            ] = True
-
-            send_to_personal_chat(
-                format_profit_lock_message(
-                    trade_id=position[
-                        "trade_id"
-                    ],
-                    symbol=symbol,
-                    old_sl=old_sl,
-                    new_sl=position["sl"],
-                    current_price=current_price,
-                    timestamp_utc=current_time_utc,
-                )
-            )
-
-            logger.info(
-                f"PROFIT LOCK | "
-                f"{symbol} | "
-                f"{position['trade_id']} | "
-                f"SL={position['sl']:.8g}"
-            )
-
-            current_sl = position["sl"]
-
-        # ----------------------------------------------------
-        # 3. TP / SL DETECTION
-        # ----------------------------------------------------
-
-        hit_tp = False
-        hit_sl = False
-
-        if side == "LONG":
-
-            if high_price >= tp:
-                hit_tp = True
-
-            if low_price <= current_sl:
-                hit_sl = True
-
-        else:
-
-            if low_price <= tp:
-                hit_tp = True
-
-            if high_price >= current_sl:
-                hit_sl = True
-
-        # ----------------------------------------------------
-        # Determine exit.
-        #
-        # If TP and SL are both touched in the same candle,
-        # we do NOT know which happened first.
-        #
-        # Conservative assumption:
-        # SL takes priority.
-        # ----------------------------------------------------
+            hit_tp = low_price <= tp
+            hit_sl = high_price >= current_sl
 
         exit_reason: Optional[str] = None
         exit_price: Optional[float] = None
 
+        # Conservative rule for ambiguous OHLC candles.
         if hit_tp and hit_sl:
-
-            exit_reason = (
-                "SL (Simultaneous TP/SL)"
-            )
-
+            exit_reason = "SL (Simultaneous TP/SL)"
             exit_price = current_sl
 
         elif hit_sl:
-
-            if (
-                position["profit_lock_triggered"]
-            ):
-
+            if position.get("profit_lock_triggered", False):
                 exit_reason = "PROFIT LOCK SL"
-
-            elif (
-                position["break_even_triggered"]
-            ):
-
+            elif position.get("break_even_triggered", False):
                 exit_reason = "BREAK-EVEN SL"
-
             else:
-
                 exit_reason = "SL"
 
             exit_price = current_sl
 
         elif hit_tp:
-
             exit_reason = "TP"
             exit_price = tp
 
-        # ----------------------------------------------------
-        # 4. CLOSE POSITION
-        # ----------------------------------------------------
+        # --------------------------------------------------------
+        # STEP 2: BE / PROFIT LOCK
+        #
+        # Only reached when the current candle did NOT close
+        # the position using the existing SL/TP.
+        # --------------------------------------------------------
+
+        if exit_reason is None:
+
+            if side == "LONG":
+                favorable_move = max(
+                    0.0,
+                    high_price - entry,
+                )
+            else:
+                favorable_move = max(
+                    0.0,
+                    entry - low_price,
+                )
+
+            progress_ratio = favorable_move / tp_distance
+
+            # ----------------------------------------------------
+            # BREAK-EVEN
+            # ----------------------------------------------------
+
+            if (
+                not position.get("break_even_triggered", False)
+                and progress_ratio
+                >= config.BREAK_EVEN_TRIGGER_RATIO
+            ):
+
+                old_sl = float(position["sl"])
+                new_sl = entry
+
+                # Never move a stop backwards.
+                if side == "LONG":
+                    new_sl = max(old_sl, new_sl)
+                else:
+                    new_sl = min(old_sl, new_sl)
+
+                position["sl"] = new_sl
+                position["break_even_triggered"] = True
+
+                _send_telegram_safely(
+                    format_break_even_message(
+                        trade_id=position["trade_id"],
+                        symbol=symbol,
+                        entry_price=entry,
+                        old_sl=old_sl,
+                        new_sl=new_sl,
+                        current_price=current_price,
+                        timestamp_utc=current_time_utc,
+                    ),
+                    f"{symbol}: break-even",
+                )
+
+                logger.info(
+                    "BREAK-EVEN | %s | %s | SL=%0.8g",
+                    symbol,
+                    position["trade_id"],
+                    new_sl,
+                )
+
+            # ----------------------------------------------------
+            # PROFIT LOCK
+            # ----------------------------------------------------
+
+            if (
+                not position.get("profit_lock_triggered", False)
+                and progress_ratio
+                >= config.PROFIT_LOCK_TRIGGER_RATIO
+            ):
+
+                if side == "LONG":
+                    locked_sl_price = (
+                        entry
+                        + tp_distance
+                        * config.PROFIT_LOCK_SL_RATIO
+                    )
+
+                    new_sl = max(
+                        float(position["sl"]),
+                        locked_sl_price,
+                    )
+
+                else:
+                    locked_sl_price = (
+                        entry
+                        - tp_distance
+                        * config.PROFIT_LOCK_SL_RATIO
+                    )
+
+                    new_sl = min(
+                        float(position["sl"]),
+                        locked_sl_price,
+                    )
+
+                old_sl = float(position["sl"])
+                position["sl"] = new_sl
+                position["profit_lock_triggered"] = True
+
+                _send_telegram_safely(
+                    format_profit_lock_message(
+                        trade_id=position["trade_id"],
+                        symbol=symbol,
+                        old_sl=old_sl,
+                        new_sl=new_sl,
+                        current_price=current_price,
+                        timestamp_utc=current_time_utc,
+                    ),
+                    f"{symbol}: profit-lock",
+                )
+
+                logger.info(
+                    "PROFIT LOCK | %s | %s | SL=%0.8g",
+                    symbol,
+                    position["trade_id"],
+                    new_sl,
+                )
+
+        # --------------------------------------------------------
+        # STEP 3: CLOSE POSITION
+        # --------------------------------------------------------
 
         if (
             exit_reason is not None
             and exit_price is not None
         ):
 
-            completed_trade = (
-                record_trade_completion(
-                    symbol=symbol,
-                    position=position,
-                    exit_price=exit_price,
-                    exit_reason=exit_reason,
-                    exit_candle_time=candle_time,
-                )
+            completed_trade = record_trade_completion(
+                symbol=symbol,
+                position=position,
+                exit_price=exit_price,
+                exit_reason=exit_reason,
+                exit_candle_time=candle_time,
             )
 
-            send_to_personal_chat(
+            _send_telegram_safely(
                 format_trade_closed_message(
                     symbol=symbol,
                     position_type=side,
                     entry=position["entry"],
                     exit_price=exit_price,
-                    initial_sl=position[
-                        "initial_sl"
-                    ],
+                    initial_sl=position["initial_sl"],
                     final_sl=position["sl"],
                     tp=position["tp"],
-                    position_size_usd=position[
-                        "size_usd"
-                    ],
+                    position_size_usd=position["size_usd"],
                     exit_reason=exit_reason,
-                    pnl_usd=completed_trade[
-                        "pnl_usd"
-                    ],
-                    pnl_pct=completed_trade[
-                        "pnl_pct"
-                    ],
-                    trade_id=position[
-                        "trade_id"
-                    ],
-                    risk_pct=position[
-                        "risk_pct"
-                    ],
-                    regime=position[
-                        "regime"
-                    ],
-                    strategy_version=position[
-                        "strategy_version"
-                    ],
-                    entry_dt_utc=position[
-                        "entry_candle_time"
-                    ],
+                    pnl_usd=completed_trade["pnl_usd"],
+                    pnl_pct=completed_trade["pnl_pct"],
+                    trade_id=position["trade_id"],
+                    risk_pct=position["risk_pct"],
+                    regime=position["regime"],
+                    strategy_version=position["strategy_version"],
+                    entry_dt_utc=position["entry_candle_time"],
                     exit_dt_utc=candle_time,
                     break_even_triggered=position[
                         "break_even_triggered"
@@ -648,22 +512,19 @@ def manage_open_positions(
                     profit_lock_triggered=position[
                         "profit_lock_triggered"
                     ],
-                )
+                ),
+                f"{symbol}: trade close",
             )
 
-            closed_trades_info[
-                symbol
-            ] = completed_trade
+            closed_trades_info[symbol] = completed_trade
 
-            del open_positions[
-                symbol
-            ]
+            del open_positions[symbol]
 
             logger.info(
-                f"POSITION CLOSED | "
-                f"{symbol} | "
-                f"{position['trade_id']} | "
-                f"{exit_reason}"
+                "POSITION CLOSED | %s | %s | %s",
+                symbol,
+                position["trade_id"],
+                exit_reason,
             )
 
     return closed_trades_info
@@ -678,17 +539,10 @@ def process_new_entry_signal(
     signal: Dict[str, Any],
     market_data: Dict[str, Any],
     current_capital: float,
-) -> Tuple[
-    bool,
-    Optional[Dict[str, Any]]
-]:
-    """
-    Validate and open a new paper position.
-    """
+) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    """Validate and open a new paper position."""
 
-    action = signal.get(
-        "action"
-    )
+    action = signal.get("action")
 
     if action in (
         None,
@@ -702,17 +556,14 @@ def process_new_entry_signal(
     # Normalize side
     # --------------------------------------------------------
 
-    side = _normalize_side(
-        action
-    )
+    side = _normalize_side(action)
 
     if side is None:
-
         logger.error(
-            f"{symbol}: unknown strategy action: "
-            f"{action}"
+            "%s: unknown strategy action: %s",
+            symbol,
+            action,
         )
-
         return False, None
 
     # --------------------------------------------------------
@@ -720,27 +571,21 @@ def process_new_entry_signal(
     # --------------------------------------------------------
 
     if symbol in open_positions:
-
         logger.debug(
-            f"{symbol}: position already exists."
+            "%s: position already exists.",
+            symbol,
         )
-
         return False, None
 
     # --------------------------------------------------------
     # Maximum concurrent positions
     # --------------------------------------------------------
 
-    if (
-        len(open_positions)
-        >= config.MAX_CONCURRENT_POSITIONS
-    ):
-
+    if len(open_positions) >= config.MAX_CONCURRENT_POSITIONS:
         logger.info(
-            f"Max concurrent positions reached. "
-            f"Cannot open {symbol}."
+            "Max concurrent positions reached. Cannot open %s.",
+            symbol,
         )
-
         return False, None
 
     # --------------------------------------------------------
@@ -762,29 +607,46 @@ def process_new_entry_signal(
     ]
 
     if missing:
-
         logger.error(
-            f"{symbol}: incomplete signal. "
-            f"Missing={missing}"
+            "%s: incomplete signal. Missing=%s",
+            symbol,
+            missing,
         )
-
         return False, None
 
-    entry_price = float(
-        signal["entry_price"]
-    )
+    try:
+        entry_price = float(signal["entry_price"])
+        stop_price = float(signal["stop_price"])
+        tp_price = float(signal["take_profit_price"])
+        risk_pct = float(signal["risk_pct"])
+    except (TypeError, ValueError) as exc:
+        logger.error(
+            "%s: invalid signal numeric value: %s",
+            symbol,
+            exc,
+        )
+        return False, None
 
-    stop_price = float(
-        signal["stop_price"]
-    )
+    # --------------------------------------------------------
+    # Validate capital
+    # --------------------------------------------------------
 
-    tp_price = float(
-        signal["take_profit_price"]
-    )
+    try:
+        current_capital = float(current_capital)
+    except (TypeError, ValueError):
+        logger.error(
+            "%s: invalid current capital: %s",
+            symbol,
+            current_capital,
+        )
+        return False, None
 
-    risk_pct = float(
-        signal["risk_pct"]
-    )
+    if current_capital <= 0:
+        logger.error(
+            "%s: current capital must be > 0.",
+            symbol,
+        )
+        return False, None
 
     # --------------------------------------------------------
     # Validate price geometry
@@ -795,14 +657,13 @@ def process_new_entry_signal(
         or stop_price <= 0
         or tp_price <= 0
     ):
-
         logger.error(
-            f"{symbol}: invalid prices | "
-            f"entry={entry_price}, "
-            f"SL={stop_price}, "
-            f"TP={tp_price}"
+            "%s: invalid prices | entry=%s, SL=%s, TP=%s",
+            symbol,
+            entry_price,
+            stop_price,
+            tp_price,
         )
-
         return False, None
 
     if side == "LONG":
@@ -810,14 +671,13 @@ def process_new_entry_signal(
         if not (
             stop_price < entry_price < tp_price
         ):
-
             logger.error(
-                f"{symbol}: invalid LONG geometry | "
-                f"SL={stop_price}, "
-                f"Entry={entry_price}, "
-                f"TP={tp_price}"
+                "%s: invalid LONG geometry | SL=%s, Entry=%s, TP=%s",
+                symbol,
+                stop_price,
+                entry_price,
+                tp_price,
             )
-
             return False, None
 
     else:
@@ -825,59 +685,115 @@ def process_new_entry_signal(
         if not (
             tp_price < entry_price < stop_price
         ):
-
             logger.error(
-                f"{symbol}: invalid SHORT geometry | "
-                f"TP={tp_price}, "
-                f"Entry={entry_price}, "
-                f"SL={stop_price}"
+                "%s: invalid SHORT geometry | TP=%s, Entry=%s, SL=%s",
+                symbol,
+                tp_price,
+                entry_price,
+                stop_price,
             )
-
             return False, None
 
     # --------------------------------------------------------
-    # Position sizing
+    # Position sizing based on risk
     # --------------------------------------------------------
 
-    position_size_usd = (
-        calculate_position_size(
-            capital=current_capital,
-            risk_pct=risk_pct,
-            entry_price=entry_price,
-            stop_price=stop_price,
-        )
+    position_size_usd = calculate_position_size(
+        capital=current_capital,
+        risk_pct=risk_pct,
+        entry_price=entry_price,
+        stop_price=stop_price,
     )
 
-    if position_size_usd <= 0:
+    try:
+        position_size_usd = float(position_size_usd)
+    except (TypeError, ValueError):
+        logger.error(
+            "%s: invalid position size returned by risk module: %s",
+            symbol,
+            position_size_usd,
+        )
+        return False, None
 
+    if position_size_usd <= 0:
         logger.warning(
-            f"{symbol}: position size <= 0. "
-            f"Trade rejected."
+            "%s: position size <= 0. Trade rejected.",
+            symbol,
+        )
+        return False, None
+
+    # --------------------------------------------------------
+    # TOTAL EXPOSURE GUARD
+    #
+    # Existing configuration allows up to:
+    # MAX_CONCURRENT_POSITIONS × MAX_POSITION_NOTIONAL_PCT
+    #
+    # With 5 × 25%, this could reach 125%.
+    #
+    # We cap the sum of all open notionals at current capital.
+    # --------------------------------------------------------
+
+    current_exposure = _get_total_open_exposure()
+
+    max_total_exposure = current_capital
+
+    remaining_exposure = max(
+        0.0,
+        max_total_exposure - current_exposure,
+    )
+
+    if remaining_exposure <= 0:
+        logger.info(
+            "%s: total exposure limit reached. "
+            "Current=$%.2f / Max=$%.2f. Trade rejected.",
+            symbol,
+            current_exposure,
+            max_total_exposure,
+        )
+        return False, None
+
+    if position_size_usd > remaining_exposure:
+        logger.info(
+            "%s: position size reduced by total exposure limit | "
+            "Requested=$%.2f | Remaining=$%.2f",
+            symbol,
+            position_size_usd,
+            remaining_exposure,
         )
 
+        position_size_usd = remaining_exposure
+
+    if position_size_usd <= 0:
+        logger.info(
+            "%s: no remaining exposure available. Trade rejected.",
+            symbol,
+        )
         return False, None
 
     # --------------------------------------------------------
     # Trade ID
     # --------------------------------------------------------
 
-    candle_time = market_data.get(
-        "candle_time"
-    )
+    candle_time = market_data.get("candle_time")
 
     if candle_time is None:
-
         logger.error(
-            f"{symbol}: candle_time missing."
+            "%s: candle_time missing.",
+            symbol,
         )
-
         return False, None
 
-    timestamp_str = (
-        candle_time.strftime(
+    try:
+        timestamp_str = candle_time.strftime(
             "%Y%m%d-%H%M%S"
         )
-    )
+    except AttributeError:
+        logger.error(
+            "%s: invalid candle_time: %s",
+            symbol,
+            candle_time,
+        )
+        return False, None
 
     trade_id = (
         f"{config.BOT_VERSION}-"
@@ -887,101 +803,74 @@ def process_new_entry_signal(
     )
 
     # --------------------------------------------------------
+    # Market regime
+    # --------------------------------------------------------
+
+    regime = market_data.get("regime", "UNKNOWN")
+
+    # --------------------------------------------------------
     # Create position
     # --------------------------------------------------------
 
     new_position = {
-
         "type": side,
-
         "entry": entry_price,
-
         "tp": tp_price,
-
         "sl": stop_price,
-
         "initial_sl": stop_price,
-
-        "size_usd": float(
-            position_size_usd
-        ),
-
+        "size_usd": position_size_usd,
         "risk_pct": risk_pct,
-
-        "regime": market_data[
-            "regime"
-        ],
-
-        "strategy_version": signal[
-            "strategy_version"
-        ],
-
+        "regime": regime,
+        "strategy_version": signal["strategy_version"],
         "entry_candle_time": candle_time,
-
         "trade_id": trade_id,
-
         "break_even_triggered": False,
-
         "profit_lock_triggered": False,
     }
 
-    open_positions[
-        symbol
-    ] = new_position
+    open_positions[symbol] = new_position
 
     # --------------------------------------------------------
-    # IMPORTANT:
-    # Mark entry candle as already processed.
-    #
-    # Otherwise main.py may immediately manage the newly
-    # opened position against the very same candle.
+    # Do not manage the entry candle again.
     # --------------------------------------------------------
 
-    last_processed_candle_time[
-        symbol
-    ] = candle_time
+    last_processed_candle_time[symbol] = candle_time
 
     logger.info(
-        f"POSITION OPENED | "
-        f"{trade_id} | "
-        f"{symbol} {side} | "
-        f"Entry={entry_price:.8g} | "
-        f"SL={stop_price:.8g} | "
-        f"TP={tp_price:.8g} | "
-        f"Size=${position_size_usd:.2f}"
+        "POSITION OPENED | %s | %s %s | Entry=%0.8g | "
+        "SL=%0.8g | TP=%0.8g | Size=$%.2f | "
+        "Exposure=$%.2f/$%.2f",
+        trade_id,
+        symbol,
+        side,
+        entry_price,
+        stop_price,
+        tp_price,
+        position_size_usd,
+        current_exposure + position_size_usd,
+        max_total_exposure,
     )
 
     # --------------------------------------------------------
     # Telegram entry notification
     # --------------------------------------------------------
 
-    try:
-
-        send_to_personal_chat(
-            format_entry_message(
-                symbol=symbol,
-                side=side,
-                entry_price=entry_price,
-                sl=stop_price,
-                tp=tp_price,
-                position_size_usd=position_size_usd,
-                regime=market_data[
-                    "regime"
-                ],
-                strategy_version=signal[
-                    "strategy_version"
-                ],
-                trade_id=trade_id,
-                entry_dt_utc=candle_time,
-                risk_pct=risk_pct,
-            )
-        )
-
-    except Exception as exc:
-
-        logger.exception(
-            f"{symbol}: entry Telegram error: {exc}"
-        )
+    _send_telegram_safely(
+        format_entry_message(
+            symbol=symbol,
+            side=side,
+            entry_price=entry_price,
+            sl=stop_price,
+            tp=tp_price,
+            position_size_usd=position_size_usd,
+            regime=regime,
+            strategy_version=signal["strategy_version"],
+            trade_id=trade_id,
+            entry_dt_utc=candle_time,
+            risk_pct=risk_pct,
+        ),
+        f"{symbol}: entry",
+    )
 
     return True, new_position
 
@@ -995,33 +884,24 @@ def process_symbol_state(
     signal: Dict[str, Any],
     market_data: Dict[str, Any],
     current_capital: float,
-) -> Tuple[
-    bool,
-    Optional[Dict[str, Any]]
-]:
+) -> Tuple[bool, Optional[Dict[str, Any]]]:
     """
     Main entry point for processing a symbol.
 
     Existing positions are managed globally by
-    manage_open_positions().
-
-    This function only attempts new entries.
+    manage_open_positions(). This function only attempts new entries.
     """
 
-    candle_time = market_data.get(
-        "candle_time"
-    )
+    candle_time = market_data.get("candle_time")
 
     if candle_time is None:
-
         logger.warning(
-            f"{symbol}: missing candle time."
+            "%s: missing candle time.",
+            symbol,
         )
-
         return False, None
 
     if symbol in open_positions:
-
         return False, None
 
     if signal.get("action") in (
@@ -1030,7 +910,6 @@ def process_symbol_state(
         "HOLD",
         "ERROR",
     ):
-
         return False, None
 
     return process_new_entry_signal(
@@ -1047,18 +926,14 @@ def process_symbol_state(
 
 def initialize_trading_state():
     """
-    Initialize the engine state.
+    Initialize engine state.
 
-    IMPORTANT:
-    Use .clear() rather than reassigning dictionaries/lists.
-
-    This preserves references held by other modules.
+    .clear() is used rather than reassignment so references held
+    by other modules remain valid.
     """
 
     open_positions.clear()
-
     last_processed_candle_time.clear()
-
     daily_completed_trades.clear()
 
     logger.info(
@@ -1082,94 +957,71 @@ def get_current_open_positions_summary(
     Otherwise use entry price as fallback.
     """
 
-    summary: List[
-        Dict[str, Any]
-    ] = []
+    summary: List[Dict[str, Any]] = []
 
-    current_market_data = (
-        current_market_data or {}
-    )
+    current_market_data = current_market_data or {}
 
-    for symbol, position in (
-        open_positions.items()
-    ):
+    for symbol, position in open_positions.items():
 
-        market_info = (
-            current_market_data.get(symbol)
-        )
+        market_info = current_market_data.get(symbol)
 
         if market_info:
 
-            current_price = float(
-                market_info["price"]
-            )
-
-            pnl_usd, pnl_pct, current_sl = (
-                get_position_pnl(
-                    position,
-                    current_price,
-                    market_info.get(
-                        "timestamp_utc"
-                    ),
+            try:
+                current_price = float(
+                    market_info["price"]
                 )
-            )
+
+                pnl_usd, pnl_pct, current_sl = (
+                    get_position_pnl(
+                        position,
+                        current_price,
+                        market_info.get("timestamp_utc"),
+                    )
+                )
+
+            except (KeyError, TypeError, ValueError) as exc:
+
+                logger.warning(
+                    "%s: invalid market data for summary: %s",
+                    symbol,
+                    exc,
+                )
+
+                current_price = float(position["entry"])
+                pnl_usd = 0.0
+                pnl_pct = 0.0
+                current_sl = float(position["sl"])
 
         else:
 
-            current_price = float(
-                position["entry"]
-            )
-
+            current_price = float(position["entry"])
             pnl_usd = 0.0
             pnl_pct = 0.0
-            current_sl = float(
-                position["sl"]
-            )
+            current_sl = float(position["sl"])
 
-        summary.append({
-
-            "symbol": symbol,
-
-            "type": position["type"],
-
-            "entry_price": position[
-                "entry"
-            ],
-
-            "current_price": current_price,
-
-            "sl": current_sl,
-
-            "tp": position["tp"],
-
-            "size_usd": position[
-                "size_usd"
-            ],
-
-            "current_pnl_usd": pnl_usd,
-
-            "current_pnl_pct": pnl_pct,
-
-            "trade_id": position[
-                "trade_id"
-            ],
-
-            "risk_pct": position[
-                "risk_pct"
-            ],
-
-            "regime": position[
-                "regime"
-            ],
-
-            "break_even_triggered": position[
-                "break_even_triggered"
-            ],
-
-            "profit_lock_triggered": position[
-                "profit_lock_triggered"
-            ],
-        })
+        summary.append(
+            {
+                "symbol": symbol,
+                "type": position["type"],
+                "entry_price": position["entry"],
+                "current_price": current_price,
+                "sl": current_sl,
+                "tp": position["tp"],
+                "size_usd": position["size_usd"],
+                "current_pnl_usd": pnl_usd,
+                "current_pnl_pct": pnl_pct,
+                "trade_id": position["trade_id"],
+                "risk_pct": position["risk_pct"],
+                "regime": position["regime"],
+                "break_even_triggered": position[
+                    "break_even_triggered"
+                ],
+                "profit_lock_triggered": position[
+                    "profit_lock_triggered"
+                ],
+            }
+        )
 
     return summary
 
@@ -1178,35 +1030,24 @@ def get_current_open_positions_summary(
 # DAILY JOURNAL DATA
 # ============================================================
 
-def get_daily_journal_data(
-) -> Tuple[
+def get_daily_journal_data() -> Tuple[
     List[Dict[str, Any]],
     Dict[str, Any],
 ]:
-    """
-    Return completed trades and statistics.
-    """
+    """Return completed trades and daily statistics."""
 
-    num_trades = len(
-        daily_completed_trades
-    )
+    num_trades = len(daily_completed_trades)
 
     wins = sum(
         1
-        for trade
-        in daily_completed_trades
-        if trade.get(
-            "pnl_usd", 0.0
-        ) > 0
+        for trade in daily_completed_trades
+        if trade.get("pnl_usd", 0.0) > 0
     )
 
     losses = sum(
         1
-        for trade
-        in daily_completed_trades
-        if trade.get(
-            "pnl_usd", 0.0
-        ) < 0
+        for trade in daily_completed_trades
+        if trade.get("pnl_usd", 0.0) < 0
     )
 
     breakeven = (
@@ -1216,11 +1057,8 @@ def get_daily_journal_data(
     )
 
     pnl_total = sum(
-        trade.get(
-            "pnl_usd", 0.0
-        )
-        for trade
-        in daily_completed_trades
+        trade.get("pnl_usd", 0.0)
+        for trade in daily_completed_trades
     )
 
     win_rate = (
@@ -1230,17 +1068,11 @@ def get_daily_journal_data(
     )
 
     stats = {
-
         "trades": num_trades,
-
         "wins": wins,
-
         "losses": losses,
-
         "breakeven": breakeven,
-
         "pnl_usd": pnl_total,
-
         "win_rate": win_rate,
     }
 
