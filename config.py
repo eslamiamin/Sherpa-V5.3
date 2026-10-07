@@ -18,27 +18,13 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 # TRADING / ANALYSIS CONFIGURATION
 # ============================================================
 # Target symbols to analyze and trade
-SYMBOLS = [
+SYMBOLS: list[str] = [
     "BTCUSDT",
     "ETHUSDT",
     "SOLUSDT",
     "BNBUSDT",
-    "ADAUSDT",
-    "XRPUSDT",
-    "DOGEUSDT",
     "AVAXUSDT",
-    "LINKUSDT",
-    "DOTUSDT",
     "NEARUSDT",
-    "SUIUSDT",
-    "APTUSDT",
-    "OPUSDT",
-    "ARBUSDT",
-    "RENDERUSDT",
-    "FETUSDT",
-    "INJUSDT",
-    "TIAUSDT",
-    "SEIUSDT",
 ]
 
 # Timeframes configuration
